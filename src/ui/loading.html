@@ -17,24 +17,31 @@
     html, body {
       margin: 0;
       height: 100%;
+      /* Prevent any scrollbar from appearing/shifting the centered card at
+         startup (WebView2 first-paint can briefly overflow). */
+      overflow: hidden;
       background: var(--bg);
       color: var(--fg);
       font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
     }
+    /* Grid centering is stable against first-paint viewport quirks and keeps
+       the card pinned to the true center while the webview settles. */
     body {
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      display: grid;
+      place-items: center;
     }
     .card {
       text-align: center;
       padding: 48px 56px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      box-shadow: 0 12px 40px rgba(27, 31, 35, 0.12);
       max-width: 420px;
+      /* 启动时先隐藏卡片:窗口由 Rust 侧以“创建即最大化”方式显示(无最大化
+         过渡)，等首帧绘制完成后由 JS setTimeout 再淡入，避免启动瞬间
+         loading 内容跟着窗口一起闪烁。 */
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.25s ease;
     }
+    .card.visible { opacity: 1; visibility: visible; }
     h1 { font-size: 20px; margin: 20px 0 8px; letter-spacing: 0.3px; }
     p#status { color: var(--muted); font-size: 14px; margin: 0; }
     .spinner {
@@ -55,28 +62,33 @@
   </style>
 </head>
 <body>
-  <div class="card">
+  <div class="card" id="card">
     <div class="spinner"></div>
-    <h1>DeepSeek Harness</h1>
-    <p id="status">正在加载…</p>
+    <p id="status"></p>
     <div id="error" hidden>
       <h2>无法启动 DeepSeek Harness 服务</h2>
       <ul>
         <li>请确认已安装 <a href="https://nodejs.org/zh-cn" target="_blank" rel="noreferrer">Node.js</a></li>
-        <li>请确认已安装 dsh：<code>npm install -g @deepseek-ai/dsh</code></li>
+        <li>请确认已安装 dsh:<code>npm install -g @deepseek-ai/dsh</code></li>
         <li>请确认端口 3080 未被其他程序占用</li>
       </ul>
     </div>
   </div>
   <script>
-    // 正常启动时由 Rust 侧负责拉起服务器并导航到目标页面；此处仅做兜底：
-    // 若 20 秒后仍未离开本页（服务器未就绪/导航失败），显示引导提示。
-    // 由 "更多" -> "关闭 dsh" 导航到本页时带 mode=stopped：显示已停止状态。
+    // 正常启动时由 Rust 侧负责拉起服务器并导航到目标页面；此处仅做兜底:
+    // 若 20 秒后仍未离开本页(服务器未就绪/导航失败)，显示引导提示。
+    // 由 "更多" -> "关闭 dsh" 导航到本页时带 mode=stopped:显示已停止状态。
+    var card = document.getElementById("card");
     var stopped = new URLSearchParams(location.search).get("mode") === "stopped";
     if (stopped) {
       document.querySelector(".spinner").style.display = "none";
       document.getElementById("status").textContent = "dsh 服务已停止";
+      card.classList.add("visible");
     } else {
+      // 窗口由 Rust 侧以“创建即最大化”方式显示(无最大化过渡过程)，这里只
+      // 等约 100ms 让首帧绘制完成再淡入卡片，避免启动瞬间 loading 内容
+      // 跟着窗口一起闪烁。
+      setTimeout(() => { card.classList.add("visible"); }, 100);
       setTimeout(() => {
         document.getElementById("error").hidden = false;
         document.getElementById("status").textContent = "服务未就绪";

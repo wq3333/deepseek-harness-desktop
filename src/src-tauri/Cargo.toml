@@ -1,8 +1,11 @@
 [package]
 name = "deepseek-harness"
-version = "1.0.0"
+version = "1.0.1"
 description = "DeepSeek Harness desktop shell (Tauri v2)"
 edition = "2021"
+
+[lints.rust]
+linker_messages = "allow"
 
 [lib]
 name = "deepseek_harness_lib"

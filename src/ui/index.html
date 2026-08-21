@@ -257,13 +257,48 @@
     }
     .about-actions button.primary:hover:not(:disabled) { background: #0a5fc0; }
     .about-actions button:disabled { opacity: 0.5; cursor: default; }
+
+    /* repo link inside the about dialog */
+    .about-row a {
+      color: var(--accent);
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .about-row a:hover { text-decoration: underline; }
+
+    /* ---- about update progress bar ---- */
+    #about-progress {
+      display: none;
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+    #about-progress.visible { display: block; }
+    #about-progress-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      border-radius: 3px;
+      transition: width 0.2s ease;
+    }
+    /* indeterminate mode: a short segment sliding across the track */
+    #about-progress.indeterminate #about-progress-fill {
+      width: 40%;
+      animation: about-progress-slide 1.1s ease-in-out infinite;
+    }
+    @keyframes about-progress-slide {
+      0% { transform: translateX(-110%); }
+      100% { transform: translateX(260%); }
+    }
   </style>
 </head>
 <body>
   <div id="bar" data-tauri-drag-region="deep">
     <div class="nav" data-tauri-drag-region="false">
-      <button id="btn-chat">DeepSeek Chat</button>
-      <button id="btn-harness" class="active">DeepSeek Harness</button>
+      <button id="btn-chat">Chat</button>
+      <button id="btn-harness" class="active">Harness</button>
       <button id="btn-more" title="更多" aria-label="更多">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
           <circle cx="8" cy="3.4" r="1.5" />
@@ -294,18 +329,19 @@
   <!-- dropdown (only visible while the bar webview is expanded) -->
   <div id="backdrop" hidden></div>
   <div id="dropdown" hidden>
-    <button id="menu-stop">
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+    <!-- <button id="menu-stop">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+        stroke-linecap="round" aria-hidden="true">
         <rect x="3" y="3" width="10" height="10" rx="1.5" />
       </svg>
       关闭 dsh
-    </button>
+    </button> -->
     <button id="menu-quit" class="danger">
       <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
         <path d="M8 1.6v5.8" />
         <path d="M5.1 3.2a5.2 5.2 0 1 0 5.8 0" />
       </svg>
-      关闭 dsh + 窗口
+      关闭dsh和窗口
     </button>
     <button id="menu-restart">
       <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
@@ -343,9 +379,11 @@
       </svg>
       DeepSeek Harness Desktop
     </h2>
-    <p id="about-sub">DeepSeek Harness 原生桌面壳（Tauri）</p>
-    <div class="about-row">当前版本：<span class="value" id="about-current">…</span></div>
+    <p id="about-sub">DeepSeek Harness 原生桌面壳(Tauri)</p>
+    <div class="about-row">当前版本:<span class="value" id="about-current">…</span></div>
+    <div class="about-row">仓库:<a id="about-repo" href="#">…</a></div>
     <div id="about-status"></div>
+    <div id="about-progress"><div id="about-progress-fill"></div></div>
     <div id="about-notes" hidden></div>
     <div class="about-actions">
       <button id="about-check" class="primary">检查更新</button>
@@ -389,7 +427,7 @@
     (function () {
       var T = window.__TAURI__;
       if (!T) return;
-      // 初始高亮：标题栏 webview 由 Rust 注入 window.__DSH_TARGET__（现恒为 harness）
+      // 初始高亮:标题栏 webview 由 Rust 注入 window.__DSH_TARGET__(现恒为 harness)
       setActive(window.__DSH_TARGET__ || "harness");
 
       function invoke(cmd, args) { return T.core.invoke(cmd, args || {}); }
@@ -419,6 +457,55 @@
 
       // ---- about dialog (expands the bar webview over the content) ----
       var aboutOpen = false;
+
+      // Render the live update/check state into the About dialog: status line,
+      // progress bar (determinate or indeterminate), release notes and the
+      // enable/disable + label of the check/update buttons. Driven by the
+      // `update-progress` event and by `get_update_state` on dialog open, so
+      // closing the dialog mid-update never loses the status.
+      function renderUpdateState(s) {
+        if (!s) return;
+        var status = document.getElementById("about-status");
+        var bar = document.getElementById("about-progress");
+        var fill = document.getElementById("about-progress-fill");
+        var notes = document.getElementById("about-notes");
+        var checkBtn = document.getElementById("about-check");
+        var upd = document.getElementById("about-update");
+        var active = ["checking", "downloading", "installing", "restarting", "finalizing"].indexOf(s.phase) >= 0;
+
+        status.textContent = s.message || "";
+
+        // Show the progress bar while a phase is active, or mid-download.
+        if (active || (s.progress != null && s.progress > 0 && s.progress < 100)) {
+          bar.classList.add("visible");
+          if (s.progress != null) {
+            bar.classList.remove("indeterminate");
+            fill.style.width = Math.max(0, Math.min(100, s.progress)) + "%";
+          } else {
+            bar.classList.add("indeterminate");
+            fill.style.width = "";
+          }
+        } else {
+          bar.classList.remove("visible", "indeterminate");
+          fill.style.width = "";
+        }
+
+        if (s.release_notes && s.release_notes.trim()) {
+          notes.textContent = s.release_notes;
+          notes.hidden = false;
+        } else {
+          notes.hidden = true;
+        }
+
+        checkBtn.disabled = active;
+        if (s.latest && s.updateAvailable) {
+          upd.textContent = "更新到 v" + s.latest;
+        } else if (!active) {
+          upd.textContent = "更新";
+        }
+        upd.disabled = active || !s.updateAvailable;
+      }
+
       function showAbout() {
         aboutOpen = true;
         hideMenu();
@@ -426,21 +513,22 @@
         document.getElementById("about-backdrop").hidden = false;
         document.getElementById("about-modal").hidden = false;
         invoke("set_bar_height", { height: -1 });
-        var st = document.getElementById("about-status");
-        var notes = document.getElementById("about-notes");
-        st.textContent = "";
-        notes.hidden = true;
-        var upd = document.getElementById("about-update");
-        upd.disabled = true;
-        upd.textContent = "更新";
-        var checkBtn = document.getElementById("about-check");
-        checkBtn.disabled = false;
-        checkBtn.textContent = "检查更新";
-        invoke("get_app_version").then(function (v) {
-          document.getElementById("about-current").textContent = v || "未知";
+        invoke("get_app_info").then(function (info) {
+          if (info && info.version) {
+            document.getElementById("about-current").textContent = info.version;
+          }
+          if (info && info.repo) {
+            window.__aboutRepo = info.repo;
+            var repoEl = document.getElementById("about-repo");
+            repoEl.textContent = "github";
+            repoEl.href = "https://github.com/" + info.repo;
+          }
         }).catch(function () {
           document.getElementById("about-current").textContent = "未知";
         });
+        // Restore any in-flight / last update status (item 3: keep state
+        // across dialog close/reopen).
+        invoke("get_update_state").then(renderUpdateState).catch(function () {});
       }
       function hideAbout() {
         aboutOpen = false;
@@ -474,10 +562,10 @@
           else if (menuOpen) hideMenu();
         }
       });
-      document.getElementById("menu-stop").addEventListener("click", function () {
-        hideMenu();
-        invoke("stop_dsh");
-      });
+      // document.getElementById("menu-stop").addEventListener("click", function () {
+      //   hideMenu();
+      //   invoke("stop_dsh");
+      // });
       document.getElementById("menu-quit").addEventListener("click", function () {
         hideMenu();
         invoke("quit_with_dsh");
@@ -496,47 +584,29 @@
 
       // ---- about dialog actions ----
       document.getElementById("about-close").addEventListener("click", hideAbout);
+      document.getElementById("about-repo").addEventListener("click", function (e) {
+        e.preventDefault();
+        var repo = window.__aboutRepo || "";
+        if (repo) invoke("open_url", { url: "https://github.com/" + repo });
+      });
+      // Live update/check progress: the backend publishes an `update-progress`
+      // event on every state change; render it even when the dialog is open.
+      if (T.event) {
+        T.event.listen("update-progress", function (e) {
+          renderUpdateState(e.payload);
+        });
+      }
       document.getElementById("about-check").addEventListener("click", function () {
-        var st = document.getElementById("about-status");
-        var notes = document.getElementById("about-notes");
-        var checkBtn = document.getElementById("about-check");
-        var upd = document.getElementById("about-update");
-        st.textContent = "正在检查更新…";
-        notes.hidden = true;
-        upd.disabled = true;
-        checkBtn.disabled = true;
-        invoke("check_update").then(function (info) {
-          if (info.update_available) {
-            upd.disabled = false;
-            upd.textContent = "更新到 v" + info.latest;
-            st.textContent = "发现新版本 v" + info.latest;
-          } else {
-            upd.textContent = "更新";
-            st.textContent = "已是最新版本（v" + info.current + "）";
-          }
-          if (info.release_notes && info.release_notes.trim()) {
-            notes.textContent = info.release_notes;
-            notes.hidden = false;
-          }
-          checkBtn.disabled = false;
-        }).catch(function (e) {
-          st.textContent = "检查更新失败：" + e;
-          checkBtn.disabled = false;
+        // Optimistically disable the button; the real state comes via events.
+        renderUpdateState({ phase: "checking", message: "正在检查更新…", update_available: false });
+        invoke("check_update").catch(function (e) {
+          renderUpdateState({ phase: "error", message: "检查更新失败:" + e, update_available: false });
         });
       });
       document.getElementById("about-update").addEventListener("click", function () {
-        var st = document.getElementById("about-status");
-        var upd = document.getElementById("about-update");
-        var checkBtn = document.getElementById("about-check");
-        upd.disabled = true;
-        checkBtn.disabled = true;
-        st.textContent = "正在下载并更新，完成后将自动重启…";
-        invoke("update_app").then(function () {
-          // App normally exits here and the new exe is launched by the helper.
-        }).catch(function (e) {
-          st.textContent = "更新失败：" + e;
-          checkBtn.disabled = false;
-          upd.disabled = false;
+        renderUpdateState({ phase: "checking", message: "正在准备更新…", update_available: false });
+        invoke("update_app").catch(function (e) {
+          renderUpdateState({ phase: "error", message: "更新失败:" + e, update_available: false });
         });
       });
 
