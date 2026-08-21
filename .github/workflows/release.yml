@@ -1,0 +1,91 @@
+name: Build and Release
+
+# 触发条件：推送且项目根目录的 release.txt 发生变化；也支持手动触发。
+on:
+  push:
+    paths:
+      - 'release.txt'
+  workflow_dispatch:
+
+# 需要写入权限以创建 Release / 上传产物。
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src/src-tauri
+
+      - name: Install frontend dependencies
+        working-directory: src
+        run: npm ci
+
+      # 解析 release.txt：首行非空 = 版本号；随后非空行为本次发布说明，
+      # 遇到空行即停止（空行之后视为历史 release，不处理）。
+      - name: Parse release.txt
+        id: parse
+        shell: pwsh
+        run: |
+          $lines = Get-Content -LiteralPath release.txt -Encoding UTF8
+          $version = (($lines | Select-Object -First 1) -as [string]).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "release.txt 首行必须是版本号"
+          }
+          $body = New-Object System.Collections.Generic.List[string]
+          foreach ($line in ($lines | Select-Object -Skip 1)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { break }
+            $body.Add($line)
+          }
+          $tag = if ($version.StartsWith('v')) { $version } else { "v$version" }
+
+          # 校验应用版本（Cargo.toml）与发布版本一致，避免 About 显示的版本与 tag 不符。
+          $cargoLine = Select-String -LiteralPath src/src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $cargoVersion = $cargoLine.Matches[0].Groups[1].Value
+          if ($cargoVersion -ne $version) {
+            throw "版本不一致：release.txt=$version，Cargo.toml=$cargoVersion。请先同步两处版本号。"
+          }
+
+          # 若该 tag 已存在（例如只改了说明重新触发），跳过创建 release，避免重复。
+          $existing = (git ls-remote --tags origin) -match [regex]::Escape("refs/tags/$tag")
+          $skip = $existing -eq $true
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "skip=$skip"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "body<<EOF"
+          foreach ($line in $body) { Add-Content -Path $env:GITHUB_OUTPUT -Value $line }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "EOF"
+
+      # 仅构建便携 exe（与 src\publish.bat 一致），不产出安装包。
+      - name: Build portable exe
+        working-directory: src
+        run: npm run tauri build -- --no-bundle
+
+      - name: Create GitHub Release
+        if: steps.parse.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.parse.outputs.tag }}
+          name: ${{ steps.parse.outputs.tag }}
+          body: ${{ steps.parse.outputs.body }}
+          files: src/src-tauri/target/release/deepseek-harness.exe
+          prerelease: ${{ contains(steps.parse.outputs.version, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

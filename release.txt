@@ -1,0 +1,5 @@
+0.1.0
+DeepSeek Harness Desktop 首个版本：Tauri 原生桌面壳、自定义标题栏、内置 DeepSeek Chat / Harness 一键切换、更多菜单（关闭/重启/更新 dsh、关于）、基于 GitHub Release 的检查更新与便携 exe 自动更新、GitHub Actions 自动打包发布。
+
+0.0.1
+内部预览版。

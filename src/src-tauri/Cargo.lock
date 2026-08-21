@@ -665,6 +665,9 @@ dependencies = [
 name = "deepseek-harness"
 version = "0.1.0"
 dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",

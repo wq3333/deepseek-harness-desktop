@@ -11,6 +11,12 @@ const DEFAULT_PORT: u16 = 3080;
 /// Official DeepSeek Chat web app (requires network).
 const CHAT_URL: &str = "https://chat.deepseek.com";
 
+/// GitHub repo used by the 关于 (About) dialog for update checks and updates.
+const GITHUB_REPO: &str = "wq3333/deepseek-harness-desktop";
+/// GitHub API endpoint for the latest published release.
+const GITHUB_LATEST_API: &str =
+    "https://api.github.com/repos/wq3333/deepseek-harness-desktop/releases/latest";
+
 /// Height (logical px) of the custom title bar.
 const TITLE_BAR_HEIGHT: f64 = 44.0;
 
@@ -482,6 +488,186 @@ fn update_dsh_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<Stri
     })
 }
 
+// --- 关于 (About): app version + update check / update via GitHub releases ---
+
+/// Minimal fields of the latest GitHub release that we need, extracted by the
+/// PowerShell helper (so we never parse GitHub's full payload here).
+struct LatestRelease {
+    tag_name: String,
+    body: Option<String>,
+    asset_url: String,
+}
+
+/// Result of a manual update check, serialized back to the title bar UI.
+#[derive(serde::Serialize)]
+struct UpdateInfo {
+    current: String,
+    latest: String,
+    update_available: bool,
+    release_notes: String,
+    asset_url: String,
+}
+
+/// Write a PowerShell script to a temp file and run it hidden, returning its
+/// stdout. Using `-File` avoids the command-line quoting pitfalls of passing a
+/// multi-line script with quotes through `powershell -Command`.
+fn run_ps(script: &str) -> Result<String, String> {
+    let tmp_dir = std::env::temp_dir();
+    let ps = tmp_dir.join(format!("dsh-update-{}.ps1", std::process::id()));
+    std::fs::write(&ps, script).map_err(|e| format!("写入临时脚本失败：{e}"))?;
+    let result = run_capture(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            ps.to_str().unwrap_or_default(),
+        ],
+    );
+    let _ = std::fs::remove_file(&ps);
+    result
+}
+
+/// Fetch the latest release metadata via PowerShell (Invoke-RestMethod).
+/// GitHub requires a User-Agent header, otherwise the request is rejected
+/// with 403. A 404 (no release published yet) is reported distinctly so the
+/// UI can treat it as "up to date"; other failures return a Chinese message.
+fn fetch_latest_release() -> Result<LatestRelease, String> {
+    // Prints a compact JSON: { ok, tag, body, asset } or { ok=false, code|message }.
+    let ps = format!(
+        "$ProgressPreference='SilentlyContinue'\r\n\
+         try {{\r\n\
+         \x20 $r = Invoke-RestMethod -UseBasicParsing -Headers @{{ 'User-Agent'='deepseek-harness-desktop ({GITHUB_REPO})' }} '{GITHUB_LATEST_API}'\r\n\
+         \x20 $a = $r.assets | Where-Object {{ $_.name -ieq 'deepseek-harness.exe' }} | Select-Object -First 1\r\n\
+         \x20 if (-not $a) {{ $a = $r.assets | Where-Object {{ $_.name -like '*.exe' }} | Select-Object -First 1 }}\r\n\
+         \x20 [pscustomobject]@{{ ok=$true; tag=$r.tag_name; body=$r.body; asset=$a.browser_download_url }} | ConvertTo-Json -Compress\r\n\
+         }} catch {{\r\n\
+         \x20 $code = 0\r\n\
+         \x20 try {{ $code = $_.Exception.Response.StatusCode.value__ }} catch {{}}\r\n\
+         \x20 if ($code -eq 404) {{ [pscustomobject]@{{ ok=$false; code=404 }} | ConvertTo-Json -Compress }}\r\n\
+         \x20 else {{ [pscustomobject]@{{ ok=$false; code=0; message=($_.Exception.Message -replace '\\r?\\n',' ') }} | ConvertTo-Json -Compress }}\r\n\
+         }}"
+    );
+    let out = run_ps(&ps)?;
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).map_err(|e| format!("解析更新信息失败：{e}"))?;
+    if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+        Ok(LatestRelease {
+            tag_name: v["tag"].as_str().unwrap_or_default().to_string(),
+            body: v["body"].as_str().map(|s| s.to_string()),
+            asset_url: v["asset"].as_str().unwrap_or_default().to_string(),
+        })
+    } else if v["code"].as_i64() == Some(404) {
+        Err("暂无已发布版本".into())
+    } else {
+        Err(format!(
+            "获取 GitHub 版本信息失败：{}",
+            v["message"].as_str().unwrap_or("未知错误")
+        ))
+    }
+}
+
+/// Normalize a version string ("v1.2.3" / "1.2.3") into semver for comparison.
+fn parse_semver(s: &str) -> Option<semver::Version> {
+    semver::Version::parse(s.trim().trim_start_matches('v')).ok()
+}
+
+/// Current desktop (shell) version, shown in the 关于 dialog.
+#[tauri::command]
+async fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// Compare the running desktop version against the latest GitHub release.
+/// Never throws for "no releases yet" (treated as up to date); network / API
+/// errors come back as a Chinese error string for the UI.
+#[tauri::command]
+async fn check_update(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
+    let current = app.package_info().version.to_string();
+    let release = fetch_latest_release()?;
+    let latest_raw = release.tag_name.trim().trim_start_matches('v').to_string();
+    let update_available =
+        matches!((parse_semver(&latest_raw), parse_semver(&current)), (Some(l), Some(c)) if l > c);
+    Ok(UpdateInfo {
+        current,
+        latest: latest_raw,
+        update_available,
+        release_notes: release.body.unwrap_or_default(),
+        asset_url: release.asset_url,
+    })
+}
+
+/// Portable-exe self update: download the new exe from the latest GitHub
+/// release (via PowerShell), then hand over to a detached helper that waits
+/// for this process to exit, replaces the running exe and relaunches it. The
+/// app exits right after the helper is spawned.
+#[tauri::command]
+async fn update_app(app: tauri::AppHandle) -> Result<(), String> {
+    let release = fetch_latest_release()?;
+    if release.asset_url.is_empty() {
+        return Err("该发布中没有可用的 exe 更新包".into());
+    }
+
+    let current_exe = std::env::current_exe().map_err(|e| format!("无法定位当前程序路径：{e}"))?;
+    let exe_name = current_exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("deepseek-harness.exe");
+
+    // Download the new portable exe to a temp location via PowerShell.
+    let tmp_dir = std::env::temp_dir();
+    let tmp_exe = tmp_dir.join(format!("{exe_name}.update.exe"));
+    let ps = format!(
+        "$ProgressPreference='SilentlyContinue'\r\n\
+         Invoke-WebRequest -UseBasicParsing -Headers @{{ 'User-Agent'='deepseek-harness-desktop ({GITHUB_REPO})' }} -OutFile '{tmp}' '{url}'",
+        tmp = tmp_exe.display(),
+        url = release.asset_url,
+    );
+    run_ps(&ps).map_err(|e| format!("下载更新包失败：{e}"))?;
+
+    // Write a detached helper that waits for us to exit, swaps the exe and
+    // relaunches it. It keeps running after the parent (this app) exits, so it
+    // can overwrite the file our own process no longer locks.
+    let log = tmp_dir.join(format!("{exe_name}.update-helper.log"));
+    let helper = tmp_dir.join(format!("{exe_name}.update-helper.bat"));
+    let bat = format!(
+        "@echo off\r\n\
+         setlocal\r\n\
+         :wait\r\n\
+         tasklist /FI \"IMAGENAME eq {exe_name}\" 2>nul | find /I \"{exe_name}\" >nul\r\n\
+         if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)\r\n\
+         copy /y \"{tmp}\" \"{target}\" >nul\r\n\
+         if errorlevel 1 (echo update-copy-failed > \"{log}\" & exit /b 1)\r\n\
+         start \"\" \"{target}\"\r\n\
+         del /q \"{tmp}\" >nul 2>nul\r\n\
+         exit /b 0",
+        exe_name = exe_name,
+        tmp = tmp_exe.display(),
+        target = current_exe.display(),
+        log = log.display(),
+    );
+    std::fs::write(&helper, bat).map_err(|e| format!("写入更新脚本失败：{e}"))?;
+
+    // Spawn the helper detached (CREATE_NO_WINDOW) and quit. The helper's
+    // process tree survives this process exiting.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("cmd")
+            .args(["/c", helper.to_str().unwrap_or_default()])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("sh").arg(&helper).spawn();
+    }
+    app.exit(0);
+    Ok(())
+}
+
 pub fn run() {
     let port = active_port();
     let url = server_url(port);
@@ -514,7 +700,10 @@ pub fn run() {
             stop_dsh_cmd,
             quit_with_dsh,
             restart_dsh,
-            update_dsh
+            update_dsh,
+            get_app_version,
+            check_update,
+            update_app
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
