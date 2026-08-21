@@ -152,7 +152,14 @@ fn spawn_server(port: u16) -> std::io::Result<Child> {
         // CREATE_NO_WINDOW so no console window flashes next to the app.
         use std::os::windows::process::CommandExt;
         Command::new("cmd")
-            .args(["/c", "npx", "@deepseek-ai/dsh", "web", "--port", &port.to_string()])
+            .args([
+                "/c",
+                "npx",
+                "@deepseek-ai/dsh",
+                "web",
+                "--port",
+                &port.to_string(),
+            ])
             .creation_flags(0x0800_0000)
             .spawn()
     }
@@ -225,7 +232,9 @@ fn relayout(
     chat: &tauri::Webview,
     bar_height: f64,
 ) {
-    let Ok(inner) = window.inner_size() else { return };
+    let Ok(inner) = window.inner_size() else {
+        return;
+    };
     let scale = window.scale_factor().unwrap_or(1.0);
     let ls = inner.to_logical::<f64>(scale);
     // While the window is minimized Windows reports a tiny height (~19px);
@@ -261,7 +270,12 @@ fn attach_window_handlers(
             if window_for_layout.is_minimized().unwrap_or(true) {
                 return;
             }
-            let bar_height = app_handle_for_layout.state::<BarHeight>().0.lock().unwrap().clone();
+            let bar_height = app_handle_for_layout
+                .state::<BarHeight>()
+                .0
+                .lock()
+                .unwrap()
+                .clone();
             relayout(&window_for_layout, &bar, &harness, &chat, bar_height);
         }
     });
@@ -277,16 +291,15 @@ fn attach_window_handlers(
 /// title bar on top, and the two content webviews (harness / chat) that
 /// toggle visibility below it. chat-content is added first and hidden right
 /// away (it preloads in the background under harness-content).
-fn add_webviews(
-    window: tauri::Window,
-    app_handle: tauri::AppHandle,
-) -> tauri::Result<()> {
+fn add_webviews(window: tauri::Window, app_handle: tauri::AppHandle) -> tauri::Result<()> {
     // Size the webviews from the window's actual logical size instead of a
     // hard-coded 1280x800: the loading page is then centered at the final
     // size from its very first paint, avoiding a one-time "jump" when the
     // (maximized) window gets relaid out at startup.
     let scale = window.scale_factor().unwrap_or(1.0);
-    let inner = window.inner_size().unwrap_or(tauri::PhysicalSize::new(1280, 800));
+    let inner = window
+        .inner_size()
+        .unwrap_or(tauri::PhysicalSize::new(1280, 800));
     let ls = inner.to_logical::<f64>(scale);
     let width = ls.width.max(1.0);
     let content_h = (ls.height - TITLE_BAR_HEIGHT).max(0.0);
@@ -337,9 +350,15 @@ fn add_webviews(
 /// to `[TITLE_BAR_HEIGHT, window height]` (a small height is used for toasts).
 #[tauri::command]
 fn set_bar_height(app: tauri::AppHandle, height: f64) {
-    let Some(bar) = app.get_webview("bar") else { return };
-    let Some(window) = app.get_window("main") else { return };
-    let Ok(inner) = window.inner_size() else { return };
+    let Some(bar) = app.get_webview("bar") else {
+        return;
+    };
+    let Some(window) = app.get_window("main") else {
+        return;
+    };
+    let Ok(inner) = window.inner_size() else {
+        return;
+    };
     let scale = window.scale_factor().unwrap_or(1.0);
     let ls = inner.to_logical::<f64>(scale);
     // Same guard as relayout(): a minimized/tiny window reports a height below
@@ -480,9 +499,8 @@ fn stop_dsh_cmd(app: tauri::AppHandle) {
     let port = active_port();
     stop_dsh(&app, port);
     if let Some(content) = app.get_webview("harness-content") {
-        let _ = content.navigate(
-            url::Url::parse("http://tauri.localhost/loading.html?mode=stopped").unwrap(),
-        );
+        let _ = content
+            .navigate(url::Url::parse("http://tauri.localhost/loading.html?mode=stopped").unwrap());
     }
     show_toast(&app, "dsh 服务已停止");
 }
@@ -598,9 +616,12 @@ fn update_dsh(app: tauri::AppHandle) {
 fn update_dsh_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<String, String> {
     // npm on Windows is a .cmd shim, so run it through cmd (also resolves it
     // from PATH) with the hidden/no-console-window flag.
-    let current = run_capture("cmd", &["/c", "npm", "ls", "-g", "@deepseek-ai/dsh", "--depth=0"])
-        .ok()
-        .and_then(|out| parse_npm_version(&out));
+    let current = run_capture(
+        "cmd",
+        &["/c", "npm", "ls", "-g", "@deepseek-ai/dsh", "--depth=0"],
+    )
+    .ok()
+    .and_then(|out| parse_npm_version(&out));
     let latest = run_capture("cmd", &["/c", "npm", "view", "@deepseek-ai/dsh", "version"])?
         .trim()
         .to_string();
@@ -626,8 +647,11 @@ fn update_dsh_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<Stri
         },
     );
     stop_dsh(app, port);
-    run_capture("cmd", &["/c", "npm", "install", "-g", "@deepseek-ai/dsh@latest"])
-        .map_err(|e| format!("安装失败:{e}"))?;
+    run_capture(
+        "cmd",
+        &["/c", "npm", "install", "-g", "@deepseek-ai/dsh@latest"],
+    )
+    .map_err(|e| format!("安装失败:{e}"))?;
 
     publish_update_state(
         app,
@@ -1089,11 +1113,11 @@ pub fn run() {
             // (#f6f8fa), so the pre-webview-paint gap shows the app color
             // instead of a white flash. The loading page stays centered at the
             // final size from its first frame (no startup "jitter").
+            
             let window = tauri::window::WindowBuilder::new(app, "main")
                 .title("DeepSeek Harness")
-                .inner_size(1280.0, 800.0)
+                .inner_size(1280.0,720.0)
                 .center()
-                .maximized(true)
                 .decorations(false)
                 .resizable(true)
                 .background_color(tauri::window::Color(246, 248, 250, 255))
@@ -1104,14 +1128,17 @@ pub fn run() {
             // makes the window hidden at build time. The loading page keeps
             // its card hidden briefly (loading.html setTimeout) then fades it
             // in — no startup flash, and the loading page stays centered.
-            let _ = window.maximize();
+            // let _ = window.maximize();
             let _ = window.show();
 
             // F12 toggles DevTools on the currently visible content webview.
             // Registration can fail if another app already owns F12; that
             // must not prevent the app from starting.
             use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut};
-            if let Err(_e) = app.global_shortcut().register(Shortcut::new(None, Code::F12)) {
+            if let Err(_e) = app
+                .global_shortcut()
+                .register(Shortcut::new(None, Code::F12))
+            {
                 //eprintln!("failed to register F12 global shortcut: {e}");
             }
 

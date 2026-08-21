@@ -34,14 +34,8 @@
       text-align: center;
       padding: 48px 56px;
       max-width: 420px;
-      /* 启动时先隐藏卡片:窗口由 Rust 侧以“创建即最大化”方式显示(无最大化
-         过渡)，等首帧绘制完成后由 JS setTimeout 再淡入，避免启动瞬间
-         loading 内容跟着窗口一起闪烁。 */
-      opacity: 0;
-      visibility: hidden;
       transition: opacity 0.25s ease;
     }
-    .card.visible { opacity: 1; visibility: visible; }
     h1 { font-size: 20px; margin: 20px 0 8px; letter-spacing: 0.3px; }
     p#status { color: var(--muted); font-size: 14px; margin: 0; }
     .spinner {
@@ -88,7 +82,6 @@
       // 窗口由 Rust 侧以“创建即最大化”方式显示(无最大化过渡过程)，这里只
       // 等约 100ms 让首帧绘制完成再淡入卡片，避免启动瞬间 loading 内容
       // 跟着窗口一起闪烁。
-      setTimeout(() => { card.classList.add("visible"); }, 100);
       setTimeout(() => {
         document.getElementById("error").hidden = false;
         document.getElementById("status").textContent = "服务未就绪";
