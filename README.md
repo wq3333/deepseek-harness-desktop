@@ -4,13 +4,12 @@
 
 ## 截图
 
-![主界面](docs/screenshots/main.png)
+![对话](docs/screenshots/chat.png)
 
-![更多菜单](docs/screenshots/menu.png)
+![harness](docs/screenshots/harness.png)
 
-![关于对话框](docs/screenshots/about.png)
+![更多](docs/screenshots/more.png)
 
-> 截图保存在 `docs/screenshots/`，替换同名文件即可更新。
 
 ## 特色
 
@@ -20,7 +19,6 @@
 - **自定义标题栏**：可拖拽、窗口控制按钮、居中的导航与“更多”菜单。
 - **更多菜单**：关闭 dsh、关闭 dsh + 窗口、重启 dsh、更新 dsh、关于。
 - **更新能力**：“关于”中可检查更新并一键更新到最新版（从 GitHub Release 下载便携 exe 自动替换并重启）。
-- **插件生态**：支持 dsh 插件，推荐见下文。
 - **自动发布**：GitHub Actions 检测 `release.txt` 变化自动打包并生成 Release。
 - **单实例**：重复启动会聚焦已有窗口。
 - **全局快捷键**：`F12` 打开/关闭当前页面的 DevTools。
@@ -123,8 +121,6 @@ dsh plugin --profile web add <包名>
 0.1.0
 首个版本。
 ```
-
-> 应用内的“更多 → 关于 → 检查更新 / 更新”即从该 Release 获取最新版本并自动更新。
 
 ## License
 
