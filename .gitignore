@@ -1,0 +1,15 @@
+bin/
+obj/
+*.user
+.vs/
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+.rustup/
+.cargo/
+.npm-cache/
+.dsh-test/
+.wv2-test/
+.app-err.log
+.app-out.log
+publish/

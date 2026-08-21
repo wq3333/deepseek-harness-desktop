@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DeepSeek Title Bar</title>
+  <style>
+    :root {
+      --bar: #f6f8fa;
+      --fg: #1f2328;
+      --muted: #57606a;
+      --accent: #0969da;
+      --border: #d0d7de;
+      --hover: rgba(31, 35, 40, 0.07);
+      --active-bg: rgba(9, 105, 218, 0.10);
+      --active-border: rgba(9, 105, 218, 0.35);
+      --danger: #cf222e;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; }
+    /* Transparent page background: the bar webview is stretched over the
+       content area while the "更多" dropdown is open, so the page must let
+       the content show through (the 44px #bar strip below stays opaque). */
+    html, body {
+      background: transparent;
+      color: var(--fg);
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    /* ---- title bar strip (44px) ---- */
+    #bar {
+      position: relative;
+      display: flex;
+      align-items: center;
+      height: 44px;
+      padding: 0 0 0 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bar);
+    }
+    /* centered nav group: Chat, Harness, More(⋮) */
+    .nav {
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .nav button {
+      appearance: none;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      padding: 5px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .nav button:hover { background: var(--hover); color: var(--fg); }
+    .nav button.active {
+      background: var(--active-bg);
+      border-color: var(--active-border);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    #btn-more {
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ---- window controls: uniform 46x44, flush to the right edge ---- */
+    .win-controls {
+      margin-left: auto;
+      display: flex;
+      height: 44px;
+    }
+    .win-controls button {
+      appearance: none;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      width: 46px;
+      height: 44px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .win-controls button:hover { background: var(--hover); color: var(--fg); }
+    .win-controls button.close:hover { background: #e81123; color: #fff; }
+
+    /* ---- custom "更多" dropdown (bar webview expands over content when open) ---- */
+    #backdrop {
+      position: fixed;
+      top: 44px;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(31, 35, 40, 0.28);
+      z-index: 10;
+    }
+    #dropdown {
+      position: fixed;
+      top: 50px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(31, 35, 40, 0.16);
+      z-index: 11;
+      padding: 4px;
+    }
+    #dropdown button {
+      appearance: none;
+      border: 0;
+      background: transparent;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 9px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      color: var(--fg);
+      cursor: pointer;
+      text-align: left;
+      white-space: nowrap;
+    }
+    #dropdown button:hover { background: var(--hover); }
+    #dropdown button.danger { color: var(--danger); }
+    #dropdown button.danger:hover { background: rgba(207, 34, 46, 0.08); }
+
+    /* ---- transient toast (top-right, shown by expanding the bar a bit) ---- */
+    #toast {
+      position: fixed;
+      top: 52px;
+      right: 12px;
+      max-width: min(380px, calc(100vw - 24px));
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(31, 35, 40, 0.16);
+      padding: 10px 14px;
+      font-size: 13px;
+      color: var(--fg);
+      line-height: 1.5;
+      z-index: 20;
+      opacity: 0;
+      transform: translateY(-6px);
+      pointer-events: none;
+      transition: opacity 0.18s ease, transform 0.18s ease;
+      cursor: pointer;
+    }
+    #toast.visible { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  </style>
+</head>
+<body>
+  <div id="bar" data-tauri-drag-region="deep">
+    <div class="nav" data-tauri-drag-region="false">
+      <button id="btn-chat">DeepSeek Chat</button>
+      <button id="btn-harness" class="active">DeepSeek Harness</button>
+      <button id="btn-more" title="更多" aria-label="更多">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <circle cx="8" cy="3.4" r="1.5" />
+          <circle cx="8" cy="8" r="1.5" />
+          <circle cx="8" cy="12.6" r="1.5" />
+        </svg>
+      </button>
+    </div>
+    <div class="win-controls" data-tauri-drag-region="false">
+      <button id="btn-min" title="最小化" aria-label="最小化">
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+          <path d="M1.5 6h9" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+        </svg>
+      </button>
+      <button id="btn-max" title="最大化" aria-label="最大化">
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+          <rect x="2" y="2" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.1" />
+        </svg>
+      </button>
+      <button id="btn-close" class="close" title="关闭" aria-label="关闭">
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+          <path d="M2.4 2.4l7.2 7.2M9.6 2.4l-7.2 7.2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- dropdown (only visible while the bar webview is expanded) -->
+  <div id="backdrop" hidden></div>
+  <div id="dropdown" hidden>
+    <button id="menu-stop">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+        <rect x="3" y="3" width="10" height="10" rx="1.5" />
+      </svg>
+      关闭 dsh
+    </button>
+    <button id="menu-quit" class="danger">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+        <path d="M8 1.6v5.8" />
+        <path d="M5.1 3.2a5.2 5.2 0 1 0 5.8 0" />
+      </svg>
+      关闭 dsh + 窗口
+    </button>
+    <button id="menu-restart">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+        <path d="M13.2 8A5.2 5.2 0 1 1 11.7 4.4" />
+        <path d="M13.2 1.6v3h-3" />
+      </svg>
+      重启 dsh
+    </button>
+    <button id="menu-update">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+        <path d="M8 12V3" />
+        <path d="M4.5 6.5 8 3l3.5 3.5" />
+        <path d="M3 13h10" />
+      </svg>
+      更新 dsh
+    </button>
+  </div>
+
+  <!-- transient toast -->
+  <div id="toast"></div>
+
+  <script>
+    // Keep the single title bar's active-button highlight in sync. Called on
+    // load and by the Rust side (bar.eval("setActive('...')")) after a switch.
+    function setActive(target) {
+      var h = document.getElementById("btn-harness");
+      var c = document.getElementById("btn-chat");
+      if (h) h.classList.toggle("active", target === "harness");
+      if (c) c.classList.toggle("active", target === "chat");
+    }
+
+    // Show a transient toast. Called by the Rust side
+    // (bar.eval("showToast('...')")) after operations complete; expands the
+    // bar webview a little so the card renders below the 44px strip, then
+    // auto-dismisses and shrinks it back.
+    function showToast(text, ms) {
+      var el = document.getElementById("toast");
+      var dur = ms || 3500;
+      if (!el) return;
+      el.textContent = text;
+      el.classList.add("visible");
+      var T = window.__TAURI__;
+      if (T) T.core.invoke("set_bar_height", { height: 150 });
+      if (window.__toastTimer) clearTimeout(window.__toastTimer);
+      window.__toastTimer = setTimeout(function () {
+        el.classList.remove("visible");
+        if (T) T.core.invoke("set_bar_height", { height: 44 });
+      }, dur);
+    }
+
+    (function () {
+      var T = window.__TAURI__;
+      if (!T) return;
+      // 初始高亮：标题栏 webview 由 Rust 注入 window.__DSH_TARGET__（现恒为 harness）
+      setActive(window.__DSH_TARGET__ || "harness");
+
+      function invoke(cmd, args) { return T.core.invoke(cmd, args || {}); }
+      var win = T.window.getCurrentWindow();
+
+      // ---- custom "更多" dropdown ----
+      var menuOpen = false;
+      function hideToast() {
+        var el = document.getElementById("toast");
+        if (window.__toastTimer) clearTimeout(window.__toastTimer);
+        if (el) el.classList.remove("visible");
+        invoke("set_bar_height", { height: 44 });
+      }
+      function showMenu() {
+        menuOpen = true;
+        hideToast();
+        document.getElementById("dropdown").hidden = false;
+        document.getElementById("backdrop").hidden = false;
+        invoke("set_bar_height", { height: -1 });
+      }
+      function hideMenu() {
+        menuOpen = false;
+        document.getElementById("dropdown").hidden = true;
+        document.getElementById("backdrop").hidden = true;
+        invoke("set_bar_height", { height: 44 });
+      }
+
+      // Clicking another nav menu closes the "更多" dropdown if it is open.
+      document.getElementById("btn-chat").addEventListener("click", function () {
+        if (menuOpen) hideMenu();
+        setActive("chat");
+        invoke("switch_to", { target: "chat" });
+      });
+      document.getElementById("btn-harness").addEventListener("click", function () {
+        if (menuOpen) hideMenu();
+        setActive("harness");
+        invoke("switch_to", { target: "harness" });
+      });
+      document.getElementById("btn-more").addEventListener("click", function () {
+        if (menuOpen) { hideMenu(); } else { showMenu(); }
+      });
+      document.getElementById("backdrop").addEventListener("click", hideMenu);
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && menuOpen) hideMenu();
+      });
+      document.getElementById("menu-stop").addEventListener("click", function () {
+        hideMenu();
+        invoke("stop_dsh");
+      });
+      document.getElementById("menu-quit").addEventListener("click", function () {
+        hideMenu();
+        invoke("quit_with_dsh");
+      });
+      document.getElementById("menu-restart").addEventListener("click", function () {
+        hideMenu();
+        invoke("restart_dsh");
+      });
+      document.getElementById("menu-update").addEventListener("click", function () {
+        hideMenu();
+        invoke("update_dsh");
+      });
+      document.getElementById("toast").addEventListener("click", function () {
+        if (window.__toastTimer) clearTimeout(window.__toastTimer);
+        this.classList.remove("visible");
+        invoke("set_bar_height", { height: 44 });
+      });
+
+      document.getElementById("btn-min").addEventListener("click", function () {
+        if (menuOpen) hideMenu();
+        win.minimize();
+      });
+      document.getElementById("btn-max").addEventListener("click", function () {
+        if (menuOpen) hideMenu();
+        win.isMaximized().then(function (m) { return m ? win.unmaximize() : win.maximize(); });
+      });
+      document.getElementById("btn-close").addEventListener("click", function () {
+        invoke("quit");
+      });
+    })();
+  </script>
+</body>
+</html>
