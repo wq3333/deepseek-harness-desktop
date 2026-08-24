@@ -21,6 +21,12 @@ const GITHUB_LATEST_API: &str =
 /// Height (logical px) of the custom title bar.
 const TITLE_BAR_HEIGHT: f64 = 44.0;
 
+/// WebView2 Evergreen runtime bootstrapper download URL (used for the
+/// automatic WebView2 installation in the native pre-flight phase).
+const WEBVIEW2_BOOTSTRAPPER_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+/// Registry client GUID of the WebView2 runtime (Evergreen).
+const WEBVIEW2_CLIENT_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+
 /// Holds the child process spawned by this instance (if any), so it can be
 /// cleaned up on exit.
 struct ServerState(Mutex<Option<Child>>);
@@ -53,6 +59,74 @@ struct UpdateState {
 
 /// Latest update/check state, readable at any time via `get_update_state`.
 struct SharedUpdateState(Mutex<UpdateState>);
+
+/// One row of the startup environment checklist shown on the loading page
+/// (WebView2 / Node.js / dsh / dsh 服务).
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupItem {
+    key: String,     // "webview2" | "node" | "dsh" | "service"
+    label: String,   // display name
+    status: String,  // pending | checking | ok | installing | installed | failed
+    detail: String,  // version / failure reason
+}
+
+/// Snapshot of the startup environment check / auto-install progress, emitted
+/// to the loading page via the `setup-progress` event and readable at any time
+/// through `get_setup_state`.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupState {
+    /// detecting | installing | starting | ready | error
+    phase: String,
+    message: String,
+    /// 0..=100 for real byte downloads; None = indeterminate progress bar.
+    progress: Option<f64>,
+    items: Vec<SetupItem>,
+}
+
+/// Latest setup state, readable at any time via `get_setup_state`.
+struct SharedSetupState(Mutex<SetupState>);
+
+/// True while a setup/auto-install run is in flight (prevents a second run).
+struct SetupRunning(Mutex<bool>);
+
+fn default_setup_items() -> Vec<SetupItem> {
+    vec![
+        SetupItem { key: "webview2".into(), label: "WebView2 运行时".into(), status: "pending".into(), detail: String::new() },
+        SetupItem { key: "node".into(), label: "Node.js".into(), status: "pending".into(), detail: String::new() },
+        SetupItem { key: "dsh".into(), label: "dsh".into(), status: "pending".into(), detail: String::new() },
+        SetupItem { key: "service".into(), label: "dsh 服务".into(), status: "pending".into(), detail: String::new() },
+    ]
+}
+
+fn default_setup_state() -> SetupState {
+    SetupState {
+        phase: "detecting".into(),
+        message: "正在检测运行环境…".into(),
+        progress: None,
+        items: default_setup_items(),
+    }
+}
+
+/// Update one checklist row (status + detail) inside a SetupState copy.
+fn set_setup_item(state: &mut SetupState, key: &str, status: &str, detail: impl Into<String>) {
+    if let Some(item) = state.items.iter_mut().find(|i| i.key == key) {
+        item.status = status.to_string();
+        item.detail = detail.into();
+    }
+}
+
+/// Persist + broadcast the setup state to the loading page.
+fn publish_setup(app: &tauri::AppHandle, state: SetupState) {
+    *app.state::<SharedSetupState>().0.lock().unwrap() = state.clone();
+    let _ = app.emit("setup-progress", state);
+}
+
+/// Append one detail line to the loading page's live log (`setup-log` event).
+fn setup_log(app: &tauri::AppHandle, line: impl Into<String>) {
+    let _ = app.emit("setup-log", line.into());
+}
 
 /// True while a check/update is in flight (prevents starting another one).
 fn update_active(state: &UpdateState) -> bool {
@@ -105,6 +179,138 @@ fn run_capture(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Run a program hidden and wait, returning its exit status (no output capture —
+/// used for elevated installers like winget/msiexec where piped stdout can hang).
+fn run_status(program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
+    hidden(Command::new(program)).args(args).status()
+}
+
+/// Read machine + user PATH from the registry (what a freshly launched process
+/// would see) and merge them into this process's PATH, so tools installed by
+/// this app mid-run (Node.js, npm, the user-prefix dsh) are found by subsequent
+/// children without a restart. Registry entries win; current entries are kept
+/// (deduped) as a fallback for entries that are not registry-backed.
+fn refresh_process_path() {
+    let ps = "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')";
+    let reg = run_ps(&ps).unwrap_or_default();
+    if reg.trim().is_empty() {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for p in reg.split(';') {
+        let t = p.trim().to_string();
+        if !t.is_empty() && !parts.contains(&t) {
+            parts.push(t);
+        }
+    }
+    if let Ok(cur) = std::env::var("Path") {
+        for p in cur.split(';') {
+            let t = p.trim().to_string();
+            if !t.is_empty() && !parts.contains(&t) {
+                parts.push(t);
+            }
+        }
+    }
+    std::env::set_var("Path", parts.join(";"));
+}
+
+/// Directory used for the no-admin fallback global npm prefix.
+fn user_npm_prefix() -> std::path::PathBuf {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(base).join("deepseek-harness").join("npm")
+}
+
+/// Append `dir` to the user PATH (HKCU\Environment) if not already present.
+fn add_user_path(dir: String) {
+    let ps = format!(
+        "$p = [Environment]::GetEnvironmentVariable('Path','User')\r\n\
+         if ($p -split ';' -contains '{dir}') {{ exit 0 }}\r\n\
+         [Environment]::SetEnvironmentVariable('Path', ($p + ';' + '{dir}'), 'User')",
+        dir = dir,
+    );
+    let _ = run_ps(&ps);
+}
+
+/// Check whether the WebView2 runtime is installed (Evergreen), via the
+/// standard EdgeUpdate client registry keys (x64, x86, per-user) plus a
+/// filesystem fallback for unusual (e.g. fixed-version) installs.
+fn webview2_installed() -> bool {
+    let guid = WEBVIEW2_CLIENT_GUID;
+    for hive in [
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients",
+        r"HKLM\SOFTWARE\Microsoft\EdgeUpdate\Clients",
+        r"HKCU\SOFTWARE\Microsoft\EdgeUpdate\Clients",
+    ] {
+        let key = format!(r"{hive}\{guid}");
+        if run_capture("reg", &["query", &key, "/v", "pv"]).is_ok() {
+            return true;
+        }
+    }
+    for d in [
+        r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application",
+        r"C:\Program Files\Microsoft\EdgeWebView\Application",
+    ] {
+        if std::fs::read_dir(d).map(|mut it| it.next().is_some()).unwrap_or(false) {
+            return true;
+        }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let d = std::path::Path::new(&local)
+            .join("Microsoft")
+            .join("EdgeWebView")
+            .join("Application");
+        if std::fs::read_dir(&d).map(|mut it| it.next().is_some()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Native (no webview needed) blocking message box, used only for the WebView2
+/// pre-flight phase before any page can exist.
+#[cfg(target_os = "windows")]
+fn native_msg(title: &str, text: &str, is_error: bool) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
+    };
+    let title: Vec<u16> = std::ffi::OsStr::new(title)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let text: Vec<u16> = std::ffi::OsStr::new(text)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let flags = MB_OK | if is_error { MB_ICONERROR } else { MB_ICONINFORMATION };
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), flags);
+    }
+}
+#[cfg(not(target_os = "windows"))]
+fn native_msg(_title: &str, _text: &str, _is_error: bool) {}
+
+/// Download + install the WebView2 Evergreen runtime using the official
+/// bootstrapper. Runs entirely in the native pre-flight phase (no webview
+/// exists yet, so no page progress is possible here). The bootstrapper is
+/// launched WITHOUT /silent so its own window shows the real download/install
+/// progress; it may trigger a UAC prompt for the per-machine install.
+fn install_webview2() -> Result<(), String> {
+    let exe = std::env::temp_dir().join("MicrosoftEdgeWebview2Setup.exe");
+    let _ = std::fs::remove_file(&exe);
+    download_with_progress(WEBVIEW2_BOOTSTRAPPER_URL, &exe, &mut |_| {})?;
+    let status = run_status(exe.to_str().unwrap_or_default(), &["/install"])
+        .map_err(|e| format!("启动 WebView2 安装程序失败:{e}"))?;
+    if !status.success() {
+        return Err(format!("WebView2 安装程序退出码:{}", status.code().unwrap_or(-1)));
+    }
+    if webview2_installed() {
+        Ok(())
+    } else {
+        Err("安装完成后仍未检测到 WebView2 运行时".into())
+    }
+}
+
 /// Parse the installed version out of `npm ls -g @deepseek-ai/dsh --depth=0`
 /// output (e.g. "`-- @deepseek-ai/dsh@0.1.0-rc.7").
 fn parse_npm_version(stdout: &str) -> Option<String> {
@@ -146,27 +352,94 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
+/// Temp log file capturing the dsh server process stdout/stderr (per port), so
+/// a failed start can be diagnosed from the UI instead of an eternal spinner.
+fn server_log_path(port: u16) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("dsh-server-{port}.log"))
+}
+
+/// Last `n` non-empty lines of the per-port server log.
+fn log_tail(port: u16, n: usize) -> String {
+    let text = read_file(&server_log_path(port));
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Wait for the dsh server to become ready on `port` while the loading page
+/// shows live progress. Unlike `wait_for_port`, this fails fast: if the spawned
+/// server child has already exited before the port opens, the port will never
+/// open, so it reports the captured output immediately instead of spinning for
+/// the full timeout. It also publishes a "已等待 Xs" status every few seconds.
+/// Returns true when the port is ready.
+fn wait_server_ready(app: &tauri::AppHandle, port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut last_update = Instant::now();
+    loop {
+        if port_open(port) {
+            return true;
+        }
+        // Fail fast: if the child we spawned already exited, the port will
+        // never open — report the reason now, not after a long spin.
+        let exited: Option<i32> = {
+            let st = app.state::<ServerState>();
+            let mut guard = st.0.lock().unwrap();
+            match guard.as_mut().and_then(|c| c.try_wait().ok()).flatten() {
+                Some(status) => Some(status.code().unwrap_or(-1)),
+                None => None,
+            }
+        };
+        if let Some(code) = exited {
+            let tail = log_tail(port, 10);
+            let reason = if tail.is_empty() {
+                format!("dsh 服务进程提前退出(退出码 {code})")
+            } else {
+                format!("dsh 服务进程提前退出(退出码 {code})，最近输出：\n{tail}")
+            };
+            setup_log(app, format!("  {reason}"));
+            let mut s = app.state::<SharedSetupState>().0.lock().unwrap().clone();
+            s.phase = "error".into();
+            s.message = format!("dsh 服务启动失败:{reason}");
+            s.progress = None;
+            publish_setup(app, s);
+            return false;
+        }
+        if Instant::now() >= deadline {
+            let tail = log_tail(port, 10);
+            let msg = if tail.is_empty() {
+                format!("等待 dsh 服务启动超时(端口 {port})")
+            } else {
+                format!("等待 dsh 服务启动超时(端口 {port})，最近输出：\n{tail}")
+            };
+            setup_log(app, format!("  {msg}"));
+            return false;
+        }
+        if last_update.elapsed() >= Duration::from_secs(5) {
+            last_update = Instant::now();
+            let waited = started.elapsed().as_secs();
+            let mut s = app.state::<SharedSetupState>().0.lock().unwrap().clone();
+            s.message = format!("正在启动 dsh 服务…（已等待 {waited}s）");
+            publish_setup(app, s);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 fn spawn_server(port: u16) -> std::io::Result<Child> {
     #[cfg(target_os = "windows")]
     {
         // CREATE_NO_WINDOW so no console window flashes next to the app.
         use std::os::windows::process::CommandExt;
-        Command::new("cmd")
+        Command::new("npx")
             .args([
-                "/c",
-                "npx",
                 "@deepseek-ai/dsh",
                 "web",
+                "--no-open",
                 "--port",
                 &port.to_string(),
             ])
             .creation_flags(0x0800_0000)
-            .spawn()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Command::new("npx")
-            .args(["@deepseek-ai/dsh", "web", "--port", &port.to_string()])
             .spawn()
     }
 }
@@ -471,14 +744,19 @@ fn restart_dsh(app: tauri::AppHandle) {
                 return;
             }
         }
-        if wait_for_port(port, Duration::from_secs(60)) {
+        if wait_server_ready(&app, port, Duration::from_secs(60)) {
             if let Ok(parsed) = url::Url::parse(&url) {
                 if let Some(content) = app.get_webview("harness-content") {
                     let _ = content.navigate(parsed);
                 }
             }
         } else {
-            show_toast(&app, "dsh web server did not become ready on port {port}");
+            let tail = log_tail(port, 6);
+            if tail.is_empty() {
+                show_toast(&app, "dsh 服务未能启动，请稍后重试");
+            } else {
+                show_toast(&app, format!("dsh 服务未能启动，最近输出：{}", tail));
+            }
         }
     });
 }
@@ -563,12 +841,96 @@ fn read_file(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// Download `url` to `dest` as a hidden PowerShell background process, polling
+/// the partial file size for real percent progress (`on_progress(Some(pct))`)
+/// when a Content-Length is available, else `on_progress(None)` for an
+/// indeterminate bar. Used by the auto-install flow (Node.js, WebView2).
+fn download_with_progress(
+    url: &str,
+    dest: &std::path::Path,
+    on_progress: &mut dyn FnMut(Option<f64>),
+) -> Result<(), String> {
+    let total = head_content_length(url);
+    let _ = std::fs::remove_file(dest);
+    let log = std::env::temp_dir().join(format!("dsh-download-{}.error.log", std::process::id()));
+    let ps_file = std::env::temp_dir().join(format!("dsh-download-{}.ps1", std::process::id()));
+    let ps = format!(
+        "$ProgressPreference='SilentlyContinue'\r\n\
+         try {{\r\n\
+         \x20 Invoke-WebRequest -UseBasicParsing -Headers @{{ 'User-Agent'='deepseek-harness-desktop ({GITHUB_REPO})' }} -OutFile '{dest}' '{url}'\r\n\
+         \x20 exit 0\r\n\
+         }} catch {{\r\n\
+         \x20 $_.Exception.Message | Out-File -FilePath '{err}' -Encoding utf8\r\n\
+         \x20 exit 1\r\n\
+         }}",
+        dest = dest.display(),
+        url = url,
+        err = log.display(),
+    );
+    std::fs::write(&ps_file, &ps).map_err(|e| format!("写入下载脚本失败:{e}"))?;
+    let mut child = spawn_ps_hidden(&ps_file, &log).map_err(|e| format!("启动下载失败:{e}"))?;
+
+    let mut last_pct = -1.0f64;
+    let mut last_indeterminate = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = std::fs::remove_file(&ps_file);
+                if !status.success() {
+                    let msg = read_file(&log);
+                    let _ = std::fs::remove_file(&log);
+                    return Err(if msg.trim().is_empty() {
+                        "下载失败".into()
+                    } else {
+                        msg.trim().to_string()
+                    });
+                }
+                break;
+            }
+            Ok(None) => {
+                let len = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+                match total.filter(|t| *t > 0) {
+                    Some(total) => {
+                        let pct = (len as f64 / total as f64 * 100.0).min(100.0);
+                        if (pct - last_pct).abs() >= 1.0 {
+                            last_pct = pct;
+                            on_progress(Some(pct));
+                        }
+                    }
+                    None => {
+                        // No total size: throttle the indeterminate callback so
+                        // the event stream stays light.
+                        if last_indeterminate.elapsed() >= Duration::from_secs(1) {
+                            last_indeterminate = std::time::Instant::now();
+                            on_progress(None);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&ps_file);
+                return Err("无法读取下载进程状态".into());
+            }
+        }
+    }
+
+    if std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0) == 0 {
+        return Err("下载结果为空".into());
+    }
+    Ok(())
+}
+
 /// Check for a dsh update and apply it if one is available
 /// (更多 -> "更新 dsh"). All npm steps run hidden, in a background thread,
 /// and the result is reported both through the shared update state (progress
 /// bar in the About dialog) and with a toast.
 #[tauri::command]
 fn update_dsh(app: tauri::AppHandle) {
+    if *app.state::<SetupRunning>().0.lock().unwrap() {
+        show_toast(&app, "环境检测/安装正在进行中，请稍后再试");
+        return;
+    }
     {
         let state = app.state::<SharedUpdateState>().0.lock().unwrap().clone();
         if update_active(&state) {
@@ -684,6 +1046,375 @@ fn update_dsh_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<Stri
         None => format!("dsh 已安装 v{latest}，服务已启动"),
     })
 }
+
+// --- Startup environment check + auto-install (Node.js / dsh) ---
+
+fn node_available() -> bool {
+    run_capture("cmd", &["/c", "where", "node"]).is_ok()
+        && run_capture("cmd", &["/c", "where", "npm"]).is_ok()
+}
+
+fn node_version() -> String {
+    run_capture("cmd", &["/c", "node", "--version"])
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Latest Node.js LTS version (e.g. "v22.14.0") from the official index.
+fn latest_node_version() -> Result<String, String> {
+    let ps = "$ProgressPreference='SilentlyContinue'\r\n\
+         try {\r\n\
+         \x20 $r = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent'='deepseek-harness-desktop' } 'https://nodejs.org/dist/index.json'\r\n\
+         \x20 ($r | Where-Object { $_.lts } | Select-Object -First 1).version\r\n\
+         } catch { }";
+    let out = run_ps(&ps)?;
+    let v = out.trim().to_string();
+    if v.is_empty() {
+        Err("无法获取 Node.js 最新版本(请检查网络)".into())
+    } else {
+        Ok(v)
+    }
+}
+
+/// Auto-install Node.js: winget → official MSI → no-admin portable zip.
+/// Publishes download progress and log lines to the loading page through `app`.
+fn install_node(app: &tauri::AppHandle) -> Result<String, String> {
+    // 1) winget (when available)
+    if run_capture("cmd", &["/c", "where", "winget"]).is_ok() {
+        setup_log(app, "    正在通过 winget 安装 Node.js LTS…");
+        let ok = run_status(
+            "winget",
+            &[
+                "install",
+                "--id",
+                "OpenJS.NodeJS.LTS",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+                "--disable-interactivity",
+            ],
+        )
+        .map(|s| s.success())
+        .unwrap_or(false);
+        if ok {
+            refresh_process_path();
+            if node_available() {
+                return Ok(node_version());
+            }
+        }
+        setup_log(app, "    winget 未成功，改用官方安装包…");
+    }
+
+    let version = latest_node_version()?;
+    let base_url = format!("https://nodejs.org/dist/{version}");
+
+    // 2) official MSI (silent, machine scope -> UAC prompt)
+    match install_node_msi(app, &version, &base_url) {
+        Ok(v) => return Ok(v),
+        Err(e) => setup_log(app, format!("    官方安装包失败({e})，改用便携版(免管理员)…")),
+    }
+
+    // 3) portable zip (no admin rights needed)
+    install_node_zip(app, &version, &base_url)
+}
+
+fn install_node_msi(app: &tauri::AppHandle, version: &str, base_url: &str) -> Result<String, String> {
+    let msi_url = format!("{base_url}/node-{version}-x64.msi");
+    let msi = std::env::temp_dir().join(format!("node-{version}-x64.msi"));
+    setup_log(app, format!("    正在下载 Node.js {version} 安装包…"));
+    let v2 = version.to_string();
+    download_with_progress(&msi_url, &msi, &mut |pct| {
+        let mut s = app.state::<SharedSetupState>().0.lock().unwrap().clone();
+        s.phase = "installing".into();
+        s.progress = pct;
+        s.message = match pct {
+            Some(p) => format!("正在下载 Node.js {v2}… {p:.0}%"),
+            None => format!("正在下载 Node.js {v2}…"),
+        };
+        publish_setup(app, s);
+    })?;
+    setup_log(app, "    正在静默安装(msiexec /qn)，可能需要几分钟…");
+    let status = run_status(
+        "msiexec",
+        &["/i", msi.to_str().unwrap_or_default(), "/qn", "/norestart"],
+    )
+    .map_err(|e| format!("启动 Node.js 安装失败:{e}"))?;
+    if !(status.success() || status.code() == Some(3010)) {
+        return Err(format!("Node.js 安装失败(退出码 {})", status.code().unwrap_or(-1)));
+    }
+    refresh_process_path();
+    if !node_available() {
+        return Err("Node.js 安装完成但仍无法在 PATH 中找到 node/npm".into());
+    }
+    Ok(node_version())
+}
+
+fn install_node_zip(app: &tauri::AppHandle, version: &str, base_url: &str) -> Result<String, String> {
+    let zip_url = format!("{base_url}/node-{version}-win-x64.zip");
+    let zip_file = std::env::temp_dir().join(format!("node-{version}-win-x64.zip"));
+    setup_log(app, format!("    正在下载便携版 Node.js {version}…"));
+    let v2 = version.to_string();
+    download_with_progress(&zip_url, &zip_file, &mut |pct| {
+        let mut s = app.state::<SharedSetupState>().0.lock().unwrap().clone();
+        s.phase = "installing".into();
+        s.progress = pct;
+        s.message = match pct {
+            Some(p) => format!("正在下载 Node.js {v2} 便携版… {p:.0}%"),
+            None => format!("正在下载 Node.js {v2} 便携版…"),
+        };
+        publish_setup(app, s);
+    })?;
+    let dest = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+    let dest = std::path::PathBuf::from(dest).join("Programs").join("nodejs");
+    std::fs::create_dir_all(&dest).map_err(|e| format!("创建安装目录失败:{e}"))?;
+    setup_log(app, "    正在解压并配置…");
+    let status = run_status(
+        "tar",
+        &[
+            "-xf",
+            zip_file.to_str().unwrap_or_default(),
+            "-C",
+            dest.to_str().unwrap_or_default(),
+            "--strip-components=1",
+        ],
+    )
+    .map_err(|e| format!("解压 Node.js 失败:{e}"))?;
+    if !status.success() {
+        return Err("解压 Node.js 失败".into());
+    }
+    add_user_path(dest.display().to_string());
+    refresh_process_path();
+    if !node_available() {
+        return Err("便携版 Node.js 未能生效".into());
+    }
+    Ok(node_version())
+}
+
+/// Installed dsh version (global npm prefix, falling back to the user prefix
+/// used when a global install was not permitted).
+fn dsh_version() -> Option<String> {
+    let out = run_capture("cmd", &["/c", "npm", "ls", "-g", "@deepseek-ai/dsh", "--depth=0"]).ok()?;
+    if let Some(v) = parse_npm_version(&out) {
+        return Some(v);
+    }
+    let prefix = user_npm_prefix();
+    let prefix = prefix.to_str()?;
+    let out = run_capture(
+        "cmd",
+        &["/c", "npm", "ls", "-g", "--prefix", prefix, "@deepseek-ai/dsh", "--depth=0"],
+    )
+    .ok()?;
+    parse_npm_version(&out)
+}
+
+/// Auto-install dsh globally; falls back to a user-directory prefix when the
+/// global install fails (no admin rights).
+fn install_dsh(app: &tauri::AppHandle) -> Result<String, String> {
+    setup_log(app, "    正在运行 npm install -g @deepseek-ai/dsh@latest（可能需要几分钟）…");
+    match run_capture("cmd", &["/c", "npm", "install", "-g", "@deepseek-ai/dsh@latest"]) {
+        Ok(_) => {
+            let v = dsh_version().unwrap_or_else(|| "unknown".into());
+            Ok(format!("v{v}"))
+        }
+        Err(e) => {
+            setup_log(app, format!("    全局安装失败({e})，改用用户目录安装…"));
+            let prefix = user_npm_prefix();
+            if std::fs::create_dir_all(&prefix).is_err() {
+                return Err(format!("无法创建用户目录 {}", prefix.display()));
+            }
+            let prefix_str = prefix.to_string_lossy().into_owned();
+            let cmd = format!("npm install -g --prefix \"{prefix_str}\" @deepseek-ai/dsh@latest");
+            run_capture("cmd", &["/c", cmd.as_str()])
+                .map_err(|e2| format!("全局安装失败({e})，用户目录安装也失败({e2})"))?;
+            add_user_path(prefix_str);
+            refresh_process_path();
+            let v = dsh_version().unwrap_or_else(|| "unknown".into());
+            Ok(format!("v{v}(用户目录)"))
+        }
+    }
+}
+
+fn navigate_to(app: &tauri::AppHandle, url: &str) {
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(content) = app.get_webview("harness-content") {
+            let _ = content.navigate(parsed);
+        }
+    }
+}
+
+/// Mark `key` failed, publish the error state (the loading page then shows the
+/// failure + a retry button), and return Err for the caller to bail out.
+fn setup_error(
+    app: &tauri::AppHandle,
+    mut state: SetupState,
+    key: &str,
+    title: &str,
+    detail: String,
+) -> Result<(), String> {
+    set_setup_item(&mut state, key, "failed", detail.clone());
+    state.phase = "error".into();
+    state.message = format!("{title}:{detail}");
+    state.progress = None;
+    publish_setup(app, state);
+    Err(detail)
+}
+
+/// Full startup flow: detect + auto-install missing Node.js/dsh, start the dsh
+/// server and navigate to it. Runs on a background thread and publishes live
+/// progress to the loading page (`setup-progress` / `setup-log`). Guarded by
+/// SetupRunning so only one run is active at a time.
+fn setup_and_start(app: tauri::AppHandle, port: u16, url: String) {
+    {
+        let st = app.state::<SetupRunning>();
+        let mut guard = st.0.lock().unwrap();
+        if *guard {
+            return;
+        }
+        *guard = true;
+    }
+    let _ = setup_and_start_inner(&app, port, &url);
+    *app.state::<SetupRunning>().0.lock().unwrap() = false;
+}
+
+fn setup_and_start_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<(), String> {
+    let mut state = default_setup_state();
+
+    // Fast path: dsh is already running on the port — just connect.
+    if port_open(port) {
+        setup_log(app, "检测到 dsh 服务已在运行，直接连接…");
+        set_setup_item(&mut state, "webview2", "ok", "已就绪");
+        set_setup_item(&mut state, "node", "ok", "已就绪");
+        set_setup_item(&mut state, "dsh", "ok", "已就绪");
+        set_setup_item(&mut state, "service", "installed", format!("http://127.0.0.1:{port}"));
+        state.phase = "ready".into();
+        state.message = "启动完成".into();
+        publish_setup(app, state.clone());
+        navigate_to(app, url);
+        return Ok(());
+    }
+
+    publish_setup(app, state.clone());
+    setup_log(app, "开始检查运行环境…");
+
+    // WebView2 was ensured in the native pre-flight phase before any webview.
+    set_setup_item(&mut state, "webview2", "ok", "已就绪");
+    publish_setup(app, state.clone());
+
+    // Node.js
+    setup_log(app, "[1/3] 检测 Node.js…");
+    set_setup_item(&mut state, "node", "checking", "检测中…");
+    publish_setup(app, state.clone());
+    if node_available() {
+        let v = node_version();
+        setup_log(app, format!("  已就绪({v})"));
+        set_setup_item(&mut state, "node", "ok", v);
+    } else {
+        setup_log(app, "  未检测到 Node.js，开始自动安装…");
+        set_setup_item(&mut state, "node", "installing", "正在自动安装…");
+        state.phase = "installing".into();
+        state.message = "正在安装 Node.js…".into();
+        publish_setup(app, state.clone());
+        match install_node(app) {
+            Ok(v) => {
+                setup_log(app, format!("  Node.js 安装完成({v})"));
+                set_setup_item(&mut state, "node", "installed", v);
+            }
+            Err(e) => return setup_error(app, state, "node", "Node.js 安装失败", e),
+        }
+        publish_setup(app, state.clone());
+    }
+
+    // dsh
+    setup_log(app, "[2/3] 检测 dsh…");
+    set_setup_item(&mut state, "dsh", "checking", "检测中…");
+    publish_setup(app, state.clone());
+    if let Some(v) = dsh_version() {
+        setup_log(app, format!("  已就绪(v{v})"));
+        set_setup_item(&mut state, "dsh", "ok", format!("v{v}"));
+    } else {
+        setup_log(app, "  未检测到 dsh，开始自动安装…");
+        set_setup_item(&mut state, "dsh", "installing", "正在自动安装…");
+        state.phase = "installing".into();
+        state.message = "正在安装 dsh…".into();
+        publish_setup(app, state.clone());
+        match install_dsh(app) {
+            Ok(v) => {
+                setup_log(app, format!("  dsh 安装完成({v})"));
+                set_setup_item(&mut state, "dsh", "installed", v);
+            }
+            Err(e) => return setup_error(app, state, "dsh", "dsh 安装失败", e),
+        }
+        publish_setup(app, state.clone());
+    }
+
+    // Start the dsh server.
+    setup_log(app, "[3/3] 启动 dsh 服务…");
+    set_setup_item(&mut state, "service", "installing", "正在启动…");
+    state.phase = "starting".into();
+    state.message = "正在启动 dsh 服务…".into();
+    state.progress = None;
+    publish_setup(app, state.clone());
+
+    if !port_open(port) {
+        match spawn_server(port) {
+            Ok(child) => {
+                *app.state::<ServerState>().0.lock().unwrap() = Some(child);
+            }
+            Err(e) => {
+                let msg = format!("启动 dsh 服务进程失败:{e}");
+                setup_log(app, format!("  {msg}"));
+                return setup_error(app, state, "service", "dsh 服务启动失败", msg);
+            }
+        }
+    }
+
+    // Wait for the port, failing fast when the spawned server process dies and
+    // showing live "已等待 Xs" progress so the UI never looks frozen.
+    if wait_server_ready(app, port, Duration::from_secs(180)) {
+        setup_log(app, format!("  服务已就绪(http://127.0.0.1:{port})"));
+        set_setup_item(&mut state, "service", "installed", format!("http://127.0.0.1:{port}"));
+        state.phase = "ready".into();
+        state.message = "启动完成".into();
+        state.progress = None;
+        publish_setup(app, state.clone());
+        navigate_to(app, url);
+        Ok(())
+    } else {
+        let tail = log_tail(port, 10);
+        let msg = if tail.is_empty() {
+            format!("dsh 服务启动失败(端口 {port} 未就绪)")
+        } else {
+            format!("dsh 服务启动失败，最近输出：\n{tail}")
+        };
+        setup_log(app, format!("  {msg}"));
+        setup_error(app, state, "service", "dsh 服务启动失败", msg)
+    }
+}
+
+/// Manual retry of the whole environment check / auto-install / start flow
+/// (loading page "重试" button).
+#[tauri::command]
+fn retry_setup(app: tauri::AppHandle) {
+    if update_active(&app.state::<SharedUpdateState>().0.lock().unwrap().clone()) {
+        show_toast(&app, "更新正在进行中，请稍后再试");
+        return;
+    }
+    if *app.state::<SetupRunning>().0.lock().unwrap() {
+        show_toast(&app, "环境检测/安装正在进行中");
+        return;
+    }
+    let port = active_port();
+    let url = server_url(port);
+    std::thread::spawn(move || setup_and_start(app, port, url));
+}
+
+/// Current setup state snapshot (loading page restores it on load / retry).
+#[tauri::command]
+fn get_setup_state(app: tauri::AppHandle) -> SetupState {
+    app.state::<SharedSetupState>().0.lock().unwrap().clone()
+}
+
 
 // --- 关于 (About): app version + update check / update via GitHub releases ---
 
@@ -1065,6 +1796,38 @@ pub fn run() {
     let port = active_port();
     let url = server_url(port);
 
+    // --- pre-flight (before any webview can exist): ensure WebView2 ---
+    // Without the WebView2 runtime no webview can be created, so this must
+    // happen here, natively. If it is missing we install it via the official
+    // Evergreen bootstrapper, whose own window shows the real download/install
+    // progress (a silent install would hide it). May also trigger a UAC prompt;
+    // on failure we can only tell the user via a native dialog and exit.
+    if !webview2_installed() {
+        native_msg(
+            "需要 WebView2 运行时",
+            "DeepSeek Harness Desktop 依赖 Microsoft WebView2 运行时。\n\n\
+             当前未检测到该组件，将自动下载并安装（约 100MB，会弹出系统管理员授权，请点击“是”）。\n\n\
+             随后会打开 WebView2 运行时安装窗口，请在窗口中等待下载安装完成（完成后点“关闭”即可），应用会自动继续启动。",
+            false,
+        );
+        if let Err(e) = install_webview2() {
+            native_msg(
+                "WebView2 安装失败",
+                &format!(
+                    "自动安装 WebView2 运行时失败:{e}\n\n\
+                     请手动下载并安装后重新运行本应用:\n\
+                     https://developer.microsoft.com/microsoft-edge/webview2/"
+                ),
+                true,
+            );
+            std::process::exit(1);
+        }
+    }
+    // Merge machine + user PATH from the registry into this process, so tools
+    // this app installs (Node.js, npm, user-prefix dsh) are found by its
+    // children without restarting.
+    refresh_process_path();
+
     let global_shortcut_plugin = tauri_plugin_global_shortcut::Builder::new()
         .with_handler(|app, _shortcut, event| {
             if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
@@ -1087,6 +1850,8 @@ pub fn run() {
         .manage(BarHeight(Mutex::new(TITLE_BAR_HEIGHT)))
         .manage(CurrentTarget(Mutex::new("harness".to_string())))
         .manage(SharedUpdateState(Mutex::new(UpdateState::default())))
+        .manage(SetupRunning(Mutex::new(false)))
+        .manage(SharedSetupState(Mutex::new(default_setup_state())))
         .invoke_handler(tauri::generate_handler![
             switch_to,
             quit,
@@ -1099,7 +1864,9 @@ pub fn run() {
             open_url,
             get_update_state,
             check_update,
-            update_app
+            update_app,
+            retry_setup,
+            get_setup_state
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -1142,37 +1909,52 @@ pub fn run() {
                 //eprintln!("failed to register F12 global shortcut: {e}");
             }
 
-            // --- spawn the DSH server if the port is free ---
-            let started_by_us = !port_open(port);
-            if started_by_us {
-                match spawn_server(port) {
-                    Ok(child) => {
-                        *app.state::<ServerState>().0.lock().unwrap() = Some(child);
-                    }
-                    Err(e) => {
-                        eprintln!("failed to spawn dsh web server: {e}");
-                    }
-                }
-            }
-
-            // Wait for the server (in the background so the loading page
-            // renders immediately), then point the harness content at it.
+            // --- auto environment check + install + start (background) ---
+            // The loading page renders immediately; every step of the check /
+            // install / start is published to it via `setup-progress` /
+            // `setup-log`, so a beginner sees live progress and details, and on
+            // failure gets an actionable error with a retry button.
             let url_for_thread = url.clone();
-            std::thread::spawn(move || {
-                if wait_for_port(port, Duration::from_secs(60)) {
-                    if let Ok(parsed) = url::Url::parse(&url_for_thread) {
-                        if let Some(content) = app_handle.get_webview("harness-content") {
-                            let _ = content.navigate(parsed);
-                        }
-                    }
-                } else {
-                    eprintln!("dsh web server did not become ready on port {port}");
-                }
-            });
+            std::thread::spawn(move || setup_and_start(app_handle.clone(), port, url_for_thread));
 
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_, _| {});
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_global_npm_dsh_version() {
+        assert_eq!(
+            parse_npm_version("`-- @deepseek-ai/dsh@0.1.0-rc.7\n"),
+            Some("0.1.0-rc.7".into())
+        );
+        assert_eq!(
+            parse_npm_version("  @deepseek-ai/dsh@1.2.3 deduped\n"),
+            Some("1.2.3".into())
+        );
+    }
+
+    #[test]
+    fn parse_npm_version_absent() {
+        assert_eq!(parse_npm_version(""), None);
+        assert_eq!(parse_npm_version("`-- some-other-pkg@1.0.0\n"), None);
+    }
+
+    #[test]
+    fn setup_item_status_update() {
+        let mut s = default_setup_state();
+        set_setup_item(&mut s, "node", "ok", "v22.14.0");
+        let node = s.items.iter().find(|i| i.key == "node").unwrap();
+        assert_eq!(node.status, "ok");
+        assert_eq!(node.detail, "v22.14.0");
+        // unknown keys are ignored
+        set_setup_item(&mut s, "nope", "failed", "x");
+        assert_eq!(s.items.len(), 4);
+    }
 }

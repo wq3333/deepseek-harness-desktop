@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>正在加载 DeepSeek Harness</title>
+  <title>正在启动 DeepSeek Harness</title>
   <style>
     :root {
       --bg: #f6f8fa;
@@ -12,81 +12,253 @@
       --accent: #0969da;
       --card: #ffffff;
       --border: #d0d7de;
+      --ok: #1a7f37;
+      --bad: #cf222e;
     }
     * { box-sizing: border-box; }
     html, body {
       margin: 0;
       height: 100%;
-      /* Prevent any scrollbar from appearing/shifting the centered card at
-         startup (WebView2 first-paint can briefly overflow). */
       overflow: hidden;
       background: var(--bg);
       color: var(--fg);
       font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
     }
-    /* Grid centering is stable against first-paint viewport quirks and keeps
-       the card pinned to the true center while the webview settles. */
-    body {
-      display: grid;
-      place-items: center;
-    }
+    body { display: grid; place-items: center; }
     .card {
-      text-align: center;
-      padding: 48px 56px;
-      max-width: 420px;
+      width: min(580px, calc(100vw - 48px));
+      max-height: calc(100vh - 64px);
+      overflow-y: auto;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(31, 35, 40, 0.10);
+      padding: 34px 38px;
+      text-align: left;
       transition: opacity 0.25s ease;
     }
-    h1 { font-size: 20px; margin: 20px 0 8px; letter-spacing: 0.3px; }
-    p#status { color: var(--muted); font-size: 14px; margin: 0; }
-    .spinner {
-      width: 44px;
-      height: 44px;
-      margin: 0 auto;
-      border: 4px solid var(--border);
+    .head { display: flex; align-items: center; gap: 16px; margin-bottom: 4px; }
+    .head .spinner {
+      width: 34px; height: 34px; flex: none;
+      border: 3px solid var(--border);
       border-top-color: var(--accent);
       border-radius: 50%;
       animation: spin 0.9s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    #error { margin-top: 24px; text-align: left; font-size: 13px; }
-    #error h2 { font-size: 14px; margin: 0 0 8px; color: #cf222e; }
-    #error ul { margin: 0; padding-left: 18px; color: var(--muted); line-height: 1.8; }
-    #error code { background: rgba(27, 31, 35, 0.08); padding: 1px 5px; border-radius: 4px; }
+    h1 { font-size: 18px; margin: 0 0 2px; }
+    #status {
+      color: var(--muted); font-size: 13.5px; margin: 0 0 18px;
+      min-height: 20px; line-height: 1.5; word-break: break-word;
+    }
+    #items { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+    .item {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 13px; padding: 8px 12px;
+      border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+    }
+    .item .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--border); }
+    .item.checking .dot, .item.installing .dot { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
+    .item.ok .dot, .item.installed .dot { background: var(--ok); }
+    .item.failed .dot { background: var(--bad); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .item .label { font-weight: 600; white-space: nowrap; }
+    .item .detail {
+      font-size: 12px; color: var(--muted); flex: 1 1 auto;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      text-align: right; margin-right: 6px;
+    }
+    .item .status { margin-left: auto; color: var(--muted); white-space: nowrap; }
+    .item.ok .status, .item.installed .status { color: var(--ok); }
+    .item.failed .status { color: var(--bad); }
+
+    #bar {
+      height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;
+      margin-bottom: 14px; display: none;
+    }
+    #bar.visible { display: block; }
+    #bar-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 3px; transition: width 0.2s ease; }
+    #bar.indeterminate #bar-fill { width: 35%; animation: slide 1.1s ease-in-out infinite; }
+    @keyframes slide { 0% { transform: translateX(-110%); } 100% { transform: translateX(300%); } }
+
+    #log {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px; line-height: 1.6; color: var(--fg);
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 12px; max-height: 170px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    #log .err { color: var(--bad); }
+
+    #error {
+      margin-top: 14px;
+      border: 1px solid rgba(207, 34, 46, 0.4);
+      background: rgba(207, 34, 46, 0.06);
+      border-radius: 8px; padding: 12px 14px;
+    }
+    #error h2 { font-size: 14px; margin: 0 0 8px; color: var(--bad); }
+    #error-detail { font-size: 12.5px; color: var(--fg); line-height: 1.6; margin-bottom: 8px; white-space: pre-wrap; word-break: break-word; }
+    #error ul { margin: 0 0 12px; padding-left: 18px; color: var(--muted); font-size: 12.5px; line-height: 1.8; }
     #error a { color: var(--accent); }
+    #btn-retry {
+      appearance: none; border: 0; background: var(--accent); color: #fff;
+      font-size: 13px; padding: 7px 20px; border-radius: 6px; cursor: pointer;
+    }
+    #btn-retry:hover { background: #0a5fc0; }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
   <div class="card" id="card">
-    <div class="spinner"></div>
-    <p id="status"></p>
-    <div id="error" hidden>
-      <h2>无法启动 DeepSeek Harness 服务</h2>
-      <ul>
-        <li>请确认已安装 <a href="https://nodejs.org/zh-cn" target="_blank" rel="noreferrer">Node.js</a></li>
-        <li>请确认已安装 dsh:<code>npm install -g @deepseek-ai/dsh</code></li>
-        <li>请确认端口 3080 未被其他程序占用</li>
-      </ul>
+    <div class="head">
+      <div class="spinner" id="spinner"></div>
+      <div>
+        <h1>正在启动 DeepSeek Harness</h1>
+        <p id="status">正在检测运行环境…</p>
+      </div>
+    </div>
+    <div id="items"></div>
+    <div id="bar"><div id="bar-fill"></div></div>
+    <div id="log" class="hidden"></div>
+    <div id="error" class="hidden">
+      <h2>启动失败</h2>
+      <div id="error-detail"></div>
+      <ul id="error-hints"></ul>
+      <button id="btn-retry">重试</button>
     </div>
   </div>
   <script>
-    // 正常启动时由 Rust 侧负责拉起服务器并导航到目标页面；此处仅做兜底:
-    // 若 20 秒后仍未离开本页(服务器未就绪/导航失败)，显示引导提示。
-    // 由 "更多" -> "关闭 dsh" 导航到本页时带 mode=stopped:显示已停止状态。
-    var card = document.getElementById("card");
-    var stopped = new URLSearchParams(location.search).get("mode") === "stopped";
-    if (stopped) {
-      document.querySelector(".spinner").style.display = "none";
-      document.getElementById("status").textContent = "dsh 服务已停止";
-      card.classList.add("visible");
-    } else {
-      // 窗口由 Rust 侧以“创建即最大化”方式显示(无最大化过渡过程)，这里只
-      // 等约 100ms 让首帧绘制完成再淡入卡片，避免启动瞬间 loading 内容
-      // 跟着窗口一起闪烁。
-      setTimeout(() => {
-        document.getElementById("error").hidden = false;
-        document.getElementById("status").textContent = "服务未就绪";
-      }, 20000);
-    }
+    (function () {
+      var T = window.__TAURI__;
+      var stopped = new URLSearchParams(location.search).get("mode") === "stopped";
+      if (stopped) {
+        document.querySelector(".spinner").style.display = "none";
+        document.getElementById("status").textContent = "dsh 服务已停止";
+        return;
+      }
+
+      var statusEl = document.getElementById("status");
+      var itemsEl = document.getElementById("items");
+      var barEl = document.getElementById("bar");
+      var fillEl = document.getElementById("bar-fill");
+      var logEl = document.getElementById("log");
+      var errorEl = document.getElementById("error");
+      var errDetail = document.getElementById("error-detail");
+      var errHints = document.getElementById("error-hints");
+      var spinner = document.getElementById("spinner");
+      var retryBtn = document.getElementById("btn-retry");
+
+      var STATUS_LABEL = {
+        pending: "等待中",
+        checking: "检测中…",
+        ok: "已就绪",
+        installing: "安装中…",
+        installed: "已完成",
+        failed: "失败"
+      };
+
+      // Any progress event / log line resets the "still waiting" watchdog.
+      var lastActivity = Date.now();
+
+      function render(state) {
+        if (!state) return;
+        lastActivity = Date.now();
+        statusEl.textContent = state.message || "正在检测运行环境…";
+
+        // checklist
+        var items = state.items || [];
+        itemsEl.innerHTML = "";
+        items.forEach(function (it) {
+          var row = document.createElement("div");
+          row.className = "item " + (it.status || "pending");
+          var dot = document.createElement("span"); dot.className = "dot";
+          var label = document.createElement("span"); label.className = "label"; label.textContent = it.label || it.key;
+          var detail = document.createElement("span"); detail.className = "detail"; detail.textContent = it.detail || "";
+          var st = document.createElement("span"); st.className = "status"; st.textContent = STATUS_LABEL[it.status] || it.status;
+          row.appendChild(dot); row.appendChild(label); row.appendChild(detail); row.appendChild(st);
+          itemsEl.appendChild(row);
+        });
+
+        // progress bar (determinate when a percent is available)
+        var active = ["detecting", "installing", "starting"].indexOf(state.phase) >= 0;
+        if (active) {
+          barEl.classList.add("visible");
+          if (state.progress != null) {
+            barEl.classList.remove("indeterminate");
+            fillEl.style.width = Math.max(0, Math.min(100, state.progress)) + "%";
+          } else {
+            barEl.classList.add("indeterminate");
+            fillEl.style.width = "";
+          }
+        } else {
+          barEl.classList.remove("visible", "indeterminate");
+          fillEl.style.width = "";
+        }
+
+        if (state.phase === "error") {
+          spinner.style.display = "none";
+          showError(state.message || "未知错误");
+        } else if (state.phase === "ready") {
+          spinner.style.display = "none";
+          errorEl.classList.add("hidden");
+        } else {
+          spinner.style.display = "";
+          errorEl.classList.add("hidden");
+        }
+      }
+
+      function showError(msg) {
+        errorEl.classList.remove("hidden");
+        errDetail.textContent = msg;
+        errHints.innerHTML = "";
+        [
+          "请确认网络连接正常，且没有拒绝系统的管理员授权(UAC)提示。",
+          "Node.js 官方下载:https://nodejs.org/zh-cn",
+          "手动安装 dsh:npm install -g @deepseek-ai/dsh",
+          "若端口被占用(DSH_PORT环境变量中配置的端口,没配置默认为3080)，请先关闭占用它的程序再重试。"
+        ].forEach(function (h) {
+          var li = document.createElement("li"); li.textContent = h; errHints.appendChild(li);
+        });
+      }
+
+      function addLog(line) {
+        lastActivity = Date.now();
+        if (!line) return;
+        logEl.classList.remove("hidden");
+        var div = document.createElement("div");
+        div.textContent = line;
+        if (/失败|错误/.test(line)) div.className = "err";
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function invoke(cmd, args) { return T.core.invoke(cmd, args || {}); }
+
+      if (T && T.event) {
+        T.event.listen("setup-progress", function (e) { render(e.payload); });
+        T.event.listen("setup-log", function (e) { addLog(e.payload); });
+      }
+      retryBtn.addEventListener("click", function () {
+        errorEl.classList.add("hidden");
+        spinner.style.display = "";
+        statusEl.textContent = "正在重新检测…";
+        if (T) invoke("retry_setup");
+      });
+
+      // Restore any snapshot (e.g. this page reloaded mid-setup, or setup
+      // already finished before we attached).
+      if (T) {
+        invoke("get_setup_state").then(render).catch(function () {});
+      }
+
+      // Safety: if no progress/log event arrives for a long time, surface a
+      // hint instead of an eternal spinner.
+      setInterval(function () {
+        if (Date.now() - lastActivity > 30000) {
+          statusEl.textContent = "仍在等待中…长时间无进展时请点击下方“重试”";
+        }
+      }, 5000);
+    })();
   </script>
 </body>
 </html>

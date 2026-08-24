@@ -14,6 +14,7 @@
 
 - **原生桌面体验**:基于 Tauri v2(WebView2)，无浏览器地址栏、无系统菜单干扰。
 - **自动启动 dsh 服务**:启动时自动执行 `npx @deepseek-ai/dsh web --port 3080`(可用 `DSH_PORT` 环境变量改端口)，加载完成后自动导航到 Harness 界面。
+- **一键环境自检与自动安装**:启动时自动检测运行环境(WebView2 / Node.js / dsh)，缺失的组件会**自动下载安装**(WebView2 用官方引导器静默安装、Node.js 依次尝试 winget / 官方 MSI / 免管理员便携版、dsh 用 `npm install -g`)，安装过程、下载百分比与明细日志都会在启动页面实时展示;安装完成后自动拉起服务。若自动修复失败，页面会给出具体原因、手动指引与“重试”按钮。
 - **内置 DeepSeek Chat**:标题栏一键在 Harness 与官方 DeepSeek Chat 网页之间切换。
 - **自定义标题栏**:可拖拽、窗口控制按钮、居中的导航与“更多”菜单。
 - **更多菜单**:关闭 dsh、关闭 dsh + 窗口、重启 dsh、更新 dsh、关于。
@@ -31,6 +32,8 @@
 | [Node.js](https://nodejs.org/) ≥ 20 | 运行 dsh 服务所需 |
 | [@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | 全局安装:`npm install -g @deepseek-ai/dsh` |
 | WebView2 | Windows 10/11 系统自带，无需额外安装 |
+
+> 以上依赖缺失时，应用会在启动页面自动检测并一键安装，无需手动操作(WebView2 缺失时通过原生对话框引导安装，因为缺失它时页面无法渲染)。
 
 ### 启动
 
