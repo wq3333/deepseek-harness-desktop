@@ -431,8 +431,10 @@ fn spawn_server(port: u16) -> std::io::Result<Child> {
     {
         // CREATE_NO_WINDOW so no console window flashes next to the app.
         use std::os::windows::process::CommandExt;
-        Command::new("npx")
+        Command::new("cmd.exe")
             .args([
+                "/c",
+                "npx",
                 "@deepseek-ai/dsh",
                 "web",
                 "--no-open",
