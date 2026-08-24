@@ -91,6 +91,60 @@ struct SharedSetupState(Mutex<SetupState>);
 /// True while a setup/auto-install run is in flight (prevents a second run).
 struct SetupRunning(Mutex<bool>);
 
+// --- 设置 (user settings, persisted to settings.json) ---
+
+/// User-adjustable settings persisted to `settings.json` in the app data dir.
+/// - `close_stops_dsh`: stop the DSH server when the window closes (default off).
+/// - `auto_update`: at startup check + update dsh and the desktop app (default on).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+    close_stops_dsh: bool,
+    auto_update: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            close_stops_dsh: false,
+            auto_update: true,
+        }
+    }
+}
+
+/// Path of the persisted settings file (app data dir; falls back to the temp
+/// dir when the platform dir cannot be resolved).
+fn settings_path(app: &tauri::AppHandle) -> std::path::PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("settings.json")
+}
+
+/// Read the persisted settings; any read/parse failure falls back to defaults
+/// so a missing or corrupt file never breaks startup.
+fn load_settings(app: &tauri::AppHandle) -> Settings {
+    std::fs::read_to_string(settings_path(app))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn get_settings(app: tauri::AppHandle) -> Settings {
+    load_settings(&app)
+}
+
+#[tauri::command]
+fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
+    let path = settings_path(&app);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建设置目录失败:{e}"))?;
+    }
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("写入设置失败:{e}"))
+}
+
 fn default_setup_items() -> Vec<SetupItem> {
     vec![
         SetupItem { key: "webview2".into(), label: "WebView2 运行时".into(), status: "pending".into(), detail: String::new() },
@@ -557,7 +611,7 @@ fn attach_window_handlers(
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
-            let _ = app_handle.exit(0);
+            quit_app(&app_handle);
         }
     });
 }
@@ -700,12 +754,21 @@ fn toggle_devtools(app: tauri::AppHandle) {
     }
 }
 
-/// Exit the whole app without stopping the DSH server (title bar X button).
-/// Closing the app leaves the spawned DSH server running (orphaned) so the
-/// port keeps serving; use the "更多" -> "关闭 dsh 并退出" menu item to stop it.
+/// Exit the whole app. When the "关闭窗口时关闭 dsh 服务" setting is enabled,
+/// also stop the DSH server first (used by the title bar X, Alt+F4 and quit).
+fn quit_app(app: &tauri::AppHandle) {
+    if load_settings(app).close_stops_dsh {
+        stop_dsh(app, active_port());
+    }
+    app.exit(0);
+}
+
+/// Exit the whole app (title bar X button). The DSH server is stopped before
+/// exiting only when the "关闭窗口时关闭 dsh 服务" setting is enabled; otherwise
+/// the spawned DSH server keeps running (orphaned) so the port keeps serving.
 #[tauri::command]
 fn quit(app: tauri::AppHandle) {
-    app.exit(0);
+    quit_app(&app);
 }
 
 /// Stop the DSH server: kill whatever is LISTENING on `port`, plus the child
@@ -1275,8 +1338,12 @@ fn setup_and_start(app: tauri::AppHandle, port: u16, url: String) {
         }
         *guard = true;
     }
-    let _ = setup_and_start_inner(&app, port, &url);
+    let ok = setup_and_start_inner(&app, port, &url).is_ok();
     *app.state::<SetupRunning>().0.lock().unwrap() = false;
+    // 自动更新设置勾选时:启动就绪后后台检查并更新 dsh / 桌面程序。
+    if ok {
+        maybe_auto_update(app, port, url);
+    }
 }
 
 fn setup_and_start_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<(), String> {
@@ -1794,6 +1861,91 @@ fn update_app_inner(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// --- 启动自动更新 (自动更新 setting: check + update dsh / desktop app) ---
+
+/// Latest published dsh version on the npm registry ("" on failure).
+fn npm_latest_dsh() -> String {
+    run_capture("cmd", &["/c", "npm", "view", "@deepseek-ai/dsh", "version"])
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Startup auto-update (自动更新 setting): in a background thread, update dsh
+/// to the latest npm version and, when a strictly-newer desktop release
+/// exists, download + replace + relaunch the app. Stays silent when everything
+/// is current; only real updates (or dsh failures) surface a toast.
+fn maybe_auto_update(app: tauri::AppHandle, port: u16, url: String) {
+    if !load_settings(&app).auto_update {
+        return;
+    }
+    if *app.state::<SetupRunning>().0.lock().unwrap() {
+        return;
+    }
+    {
+        let state = app.state::<SharedUpdateState>().0.lock().unwrap().clone();
+        if update_active(&state) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        // 1) desktop app (GitHub release): update only when strictly newer.
+        match fetch_latest_release() {
+            Ok(release) => {
+                let current = app.package_info().version.to_string();
+                let latest_raw = release.tag_name.trim().trim_start_matches('v').to_string();
+                let newer = matches!(
+                    (parse_semver(&latest_raw), parse_semver(&current)),
+                    (Some(l), Some(c)) if l != c
+                );
+                if newer {
+                    show_toast(&app, "发现新版本，正在后台更新应用…");
+                    if let Err(e) = update_app_inner(&app) {
+                        publish_update_state(
+                            &app,
+                            UpdateState {
+                                phase: "error".into(),
+                                error: Some(e.clone()),
+                                message: format!("自动更新应用失败:{e}"),
+                                ..Default::default()
+                            },
+                        );
+                        show_toast(&app, format!("自动更新应用失败:{e}"));
+                    }
+                }
+            }
+            Err(_) => {} // 启动时网络失败保持安静
+        }
+
+        // 2) dsh (npm): update when not installed yet or when a newer version exists.
+        let current = dsh_version();
+        let latest = npm_latest_dsh();
+        let should_update_dsh = match (current.as_deref(), parse_semver(&latest)) {
+            (None, Some(_)) => true,
+            (Some(c), Some(l)) => parse_semver(c).map_or(true, |c| l > c),
+            _ => false,
+        };
+        if should_update_dsh {
+            match update_dsh_inner(&app, port, &url) {
+                Ok(msg) => {
+                    publish_update_state(
+                        &app,
+                        UpdateState {
+                            phase: "done".into(),
+                            message: msg.clone(),
+                            ..Default::default()
+                        },
+                    );
+                    show_toast(&app, msg);
+                }
+                Err(e) => {
+                    show_toast(&app, format!("自动更新 dsh 失败:{e}"));
+                }
+            }
+        }
+    });
+}
+
 pub fn run() {
     let port = active_port();
     let url = server_url(port);
@@ -1868,7 +2020,9 @@ pub fn run() {
             check_update,
             update_app,
             retry_setup,
-            get_setup_state
+            get_setup_state,
+            get_settings,
+            save_settings
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
