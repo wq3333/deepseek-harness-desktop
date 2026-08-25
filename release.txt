@@ -1,8 +1,5 @@
-1.1.0
-auto install WebView2/Node.js/dsh with in-page progress & details
-
 1.0.1
-optimize about window
+auto install WebView2/Node.js/dsh with in-page progress & details
 
 1.0.0
 first release

@@ -1419,7 +1419,7 @@ fn setup_and_start_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result
 
     // Start the dsh server.
     setup_log(app, "[3/3] 启动 dsh 服务…");
-    set_setup_item(&mut state, "service", "installing", "正在启动…");
+    set_setup_item(&mut state, "service", "ok", "正在启动…");
     state.phase = "starting".into();
     state.message = "正在启动 dsh 服务…".into();
     state.progress = None;
