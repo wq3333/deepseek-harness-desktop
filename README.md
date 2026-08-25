@@ -1,6 +1,6 @@
 # DeepSeek Harness Desktop
 
-把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(dsh)Web 界面封装为原生 **Windows 桌面应用**的 Tauri v2 外壳。
+把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(dsh) Web 界面封装为原生 **Windows 桌面应用**的 Tauri v2 外壳。
 
 ## 截图
 
@@ -16,8 +16,6 @@
 - **自动启动 dsh 服务**:启动时自动执行 `npx @deepseek-ai/dsh web --port 3080`(可用 `DSH_PORT` 环境变量改端口)，加载完成后自动导航到 Harness 界面。
 - **一键环境自检与自动安装**:启动时自动检测运行环境(WebView2 / Node.js / dsh)，缺失的组件会**自动下载安装**(WebView2 用官方引导器静默安装、Node.js 依次尝试 winget / 官方 MSI / 免管理员便携版、dsh 用 `npm install -g`)，安装过程、下载百分比与明细日志都会在启动页面实时展示;安装完成后自动拉起服务。若自动修复失败，页面会给出具体原因、手动指引与“重试”按钮。
 - **内置 DeepSeek Chat**:标题栏一键在 Harness 与官方 DeepSeek Chat 网页之间切换。
-- **自定义标题栏**:可拖拽、窗口控制按钮、居中的导航与“更多”菜单。
-- **更多菜单**:关闭 dsh、关闭 dsh + 窗口、重启 dsh、更新 dsh、关于。
 - **更新能力**:“关于”中可检查更新并一键更新到最新版(从 GitHub Release 下载便携 exe 自动替换并重启)。
 - **单实例**:重复启动会聚焦已有窗口。
 - **全局快捷键**:`F12` 打开/关闭当前页面的 DevTools。
@@ -37,21 +35,17 @@
 
 ### 启动
 
-- 方式一:直接运行构建产物 `publish\DeepSeekHarness.exe`。
-- 方式二:开发运行 `cd src && npm run tauri dev`。
-
-首次启动会自动安装并拉起 dsh 服务(如端口已被占用则直接复用现有服务)。关闭窗口只退出应用、保留 dsh 服务；如需一并关闭服务请使用“更多 → 关闭 dsh + 窗口”。
+- 方式一:直接运行[release/deepseek-harness.exe
+](https://github.com/wq3333/deepseek-harness-desktop/releases/latest)
+- 方式二:开发运行 `cd src && npm run tauri dev`
 
 ### 标题栏功能介绍
 
 | 区域 | 功能 |
 |---|---|
-| DeepSeek Chat | 切换到官方 DeepSeek Chat 网页 |
-| DeepSeek Harness | 切换到 dsh Harness 界面(默认) |
-| 关闭dsh和窗口 | 停止 dsh 服务并退出应用 |
-| 重启 dsh | 重启 dsh 服务并刷新界面 |
-| 更新 dsh | 检查并更新全局 `@deepseek-ai/dsh`(npm) |
-| 关于 | 查看当前桌面版本、检查更新、一键更新应用 |
+| Chat | 切换到官方 DeepSeek Chat 网页 |
+| Harness | 切换到 dsh Harness 界面(默认) |
+| 设置 | 自动关闭dsh和更新 |
 
 ## 构建
 
@@ -61,7 +55,6 @@
 |---|---|
 | [Node.js](https://nodejs.org/) ≥ 20 | 含 npm |
 | [Rust](https://rustup.rs/)(MSVC toolchain) | `rustup default stable-x86_64-pc-windows-msvc` |
-| 联网 | 拉取 cargo 依赖与 npm 依赖 |
 
 > 本项目**只产出便携 exe，不生成安装包**。WebView2 运行时为系统自带，无需打包。
 
@@ -73,7 +66,7 @@
 src\publish.bat
 ```
 
-执行后会把便携版 `deepseek-harness.exe` 复制到 `publish\DeepSeekHarness.exe`，直接双击即可运行。
+执行后会把便携版 `deepseek-harness.exe` 复制到`publish\DeepSeekHarness.exe`，直接双击即可运行。
 
 等价的手工命令:
 
