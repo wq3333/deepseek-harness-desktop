@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -8,6 +9,11 @@ use tauri::{Emitter, Manager};
 /// Default port used by the DSH web server. Override at runtime with the
 /// `DSH_PORT` environment variable (useful to test without touching 3080).
 const DEFAULT_PORT: u16 = 3080;
+
+/// How long (after the port opens) to wait for the `dsh web:` stdout line
+/// that announces the per-process access token before giving up and falling
+/// back to the persisted token / restarting the service.
+const AUTH_LINE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Official DeepSeek Chat web app (requires network).
 const CHAT_URL: &str = "https://chat.deepseek.com";
@@ -420,6 +426,187 @@ fn log_tail(port: u16, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+// --- dsh web 访问令牌 (per-process browser-auth token) ---
+
+/// Parse the authenticated dsh web URL out of the server's output.
+///
+/// dsh prints `dsh web: http://127.0.0.1:<port>/?token=...` to stdout after
+/// the loader settles (also with `--no-open`, and older versions print a
+/// plain URL without a token). The parser only keys on the `dsh web:` marker
+/// and takes the first `http://` substring that follows, cutting at
+/// whitespace, `(` (the optional ` (LAN: ...)` suffix) or an ANSI escape, so
+/// it stays robust against colors, LAN suffixes and npx noise.
+fn parse_auth_url(text: &str) -> Option<String> {
+    let marker = "dsh web:";
+    for line in text.lines() {
+        let Some(marker_at) = line.find(marker) else {
+            continue;
+        };
+        let Some(rel) = line[marker_at..].find("http://") else {
+            continue;
+        };
+        let start = marker_at + rel;
+        let rest = &line[start..];
+        let end = rest
+            .find(|c| c == ' ' || c == '(' || c == '\u{1b}')
+            .unwrap_or(rest.len());
+        let url = rest[..end].trim();
+        if !url.is_empty() {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+/// Extract the current server's authenticated URL from the per-port log
+/// (None when the log is missing or dsh has not announced its URL yet).
+fn auth_url_from_log(port: u16) -> Option<String> {
+    parse_auth_url(&read_file(&server_log_path(port)))
+}
+
+/// Wait for the `dsh web:` URL line to appear in the log (used right after
+/// (re)starting the server: the port opens slightly before the URL line is
+/// printed). Always reads once first, so a zero timeout is a single try.
+fn wait_auth_url(port: u16, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(url) = auth_url_from_log(port) {
+            return Some(url);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Extract the `token` query parameter from an authenticated dsh web URL.
+fn url_token(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    parsed
+        .query_pairs()
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
+}
+
+/// Check that a previously captured token still authenticates the server on
+/// `port`. The token belongs to one server process, so a stale token (server
+/// restarted elsewhere) returns false. URLs without a token (legacy dsh)
+/// cannot be probed and are treated as valid.
+fn probe_auth_url(port: u16, url: &str) -> bool {
+    let Some(token) = url_token(url) else {
+        return true;
+    };
+    let mut stream = match std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(3),
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let req = format!(
+        "GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 32];
+    let n = match stream.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.starts_with("HTTP/1.1 303") || head.starts_with("HTTP/1.1 200")
+}
+
+/// Path of the persisted last-known authenticated URL (app data dir), so a
+/// still-running server from an earlier app run can be reconnected even if
+/// the temp server log has been cleaned up.
+fn auth_url_file(app: &tauri::AppHandle) -> std::path::PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("auth-url.txt")
+}
+
+fn persisted_auth_url(app: &tauri::AppHandle) -> Option<String> {
+    let text = std::fs::read_to_string(auth_url_file(app)).ok()?;
+    let url = text.trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+fn save_auth_url(app: &tauri::AppHandle, url: &str) {
+    let file = auth_url_file(app);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, url);
+}
+
+/// Resolve the URL the harness webview should be pointed at, once the server
+/// is known to be up on `port`:
+/// 1. the just-started (or previously-app-started) server's log line;
+/// 2. the persisted URL from an earlier run (same still-running process);
+/// 3. failing both, restart the service so we own the process and can read
+///    its token from stdout;
+/// 4. legacy dsh (no token line) falls back to the plain server URL.
+/// Returns None only when a restart attempt itself failed (the error is
+/// already published to the loading page by `wait_server_ready`).
+fn ensure_auth_url(app: &tauri::AppHandle, port: u16) -> Option<String> {
+    let spawned_by_us = app.state::<ServerState>().0.lock().unwrap().is_some();
+    let timeout = if spawned_by_us {
+        AUTH_LINE_TIMEOUT
+    } else {
+        Duration::ZERO
+    };
+
+    // 1) token announced by the running server (fresh spawn or previous run).
+    if let Some(url) = wait_auth_url(port, timeout) {
+        if probe_auth_url(port, &url) {
+            save_auth_url(app, &url);
+            return Some(url);
+        }
+    }
+
+    // 2) persisted URL for a still-running server we started earlier.
+    if let Some(url) = persisted_auth_url(app) {
+        if probe_auth_url(port, &url) {
+            return Some(url);
+        }
+    }
+
+    // 3) no usable token: restart so we own the process and capture its line.
+    setup_log(app, "  未获取到 dsh 访问令牌，正在重启 dsh 服务以建立连接…");
+    let mut s = app.state::<SharedSetupState>().0.lock().unwrap().clone();
+    s.phase = "starting".into();
+    s.message = "正在重启 dsh 服务以获取访问令牌…".into();
+    s.progress = None;
+    publish_setup(app, s);
+    stop_dsh(app, port);
+    match spawn_server(port) {
+        Ok(child) => {
+            *app.state::<ServerState>().0.lock().unwrap() = Some(child);
+        }
+        Err(e) => {
+            setup_log(app, format!("  重启 dsh 服务失败:{e}"));
+            return None;
+        }
+    }
+    if !wait_server_ready(app, port, Duration::from_secs(60)) {
+        return None; // wait_server_ready already published the error state
+    }
+    if let Some(url) = wait_auth_url(port, AUTH_LINE_TIMEOUT) {
+        save_auth_url(app, &url);
+        return Some(url);
+    }
+    // 4) legacy dsh: no token line printed, navigate plain.
+    Some(server_url(port))
+}
+
 /// Wait for the dsh server to become ready on `port` while the loading page
 /// shows live progress. Unlike `wait_for_port`, this fails fast: if the spawned
 /// server child has already exited before the port opens, the port will never
@@ -485,6 +672,13 @@ fn spawn_server(port: u16) -> std::io::Result<Child> {
     {
         // CREATE_NO_WINDOW so no console window flashes next to the app.
         use std::os::windows::process::CommandExt;
+        // Capture the child's stdout/stderr into the per-port log: that is the
+        // only place the `dsh web: http://127.0.0.1:<port>/?token=...` line
+        // (carrying the per-process access token) is announced, and it also
+        // makes failed starts show real output. Truncating discards any stale
+        // line from a previous server process on the same port.
+        let log = File::create(server_log_path(port))?;
+        let err = log.try_clone()?;
         Command::new("cmd.exe")
             .args([
                 "/c",
@@ -495,6 +689,8 @@ fn spawn_server(port: u16) -> std::io::Result<Child> {
                 "--port",
                 &port.to_string(),
             ])
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err))
             .creation_flags(0x0800_0000)
             .spawn()
     }
@@ -795,7 +991,6 @@ fn quit_with_dsh(app: tauri::AppHandle) {
 #[tauri::command]
 fn restart_dsh(app: tauri::AppHandle) {
     let port = active_port();
-    let url = server_url(port);
     show_toast(&app, "正在重启dsh服务...");
     std::thread::spawn(move || {
         stop_dsh(&app, port);
@@ -810,10 +1005,17 @@ fn restart_dsh(app: tauri::AppHandle) {
             }
         }
         if wait_server_ready(&app, port, Duration::from_secs(60)) {
-            if let Ok(parsed) = url::Url::parse(&url) {
-                if let Some(content) = app.get_webview("harness-content") {
-                    let _ = content.navigate(parsed);
+            // A fresh server process has a fresh access token: resolve it from
+            // stdout and navigate with it, otherwise the new dsh returns 401.
+            match ensure_auth_url(&app, port) {
+                Some(u) => {
+                    if let Ok(parsed) = url::Url::parse(&u) {
+                        if let Some(content) = app.get_webview("harness-content") {
+                            let _ = content.navigate(parsed);
+                        }
+                    }
                 }
+                None => show_toast(&app, "dsh 服务未能启动，请稍后重试"),
             }
         } else {
             let tail = log_tail(port, 6);
@@ -1012,8 +1214,7 @@ fn update_dsh(app: tauri::AppHandle) {
         },
     );
     let port = active_port();
-    let url = server_url(port);
-    std::thread::spawn(move || match update_dsh_inner(&app, port, &url) {
+    std::thread::spawn(move || match update_dsh_inner(&app, port) {
         Ok(msg) => {
             publish_update_state(
                 &app,
@@ -1040,7 +1241,7 @@ fn update_dsh(app: tauri::AppHandle) {
     });
 }
 
-fn update_dsh_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<String, String> {
+fn update_dsh_inner(app: &tauri::AppHandle, port: u16) -> Result<String, String> {
     // npm on Windows is a .cmd shim, so run it through cmd (also resolves it
     // from PATH) with the hidden/no-console-window flag.
     let current = run_capture(
@@ -1099,9 +1300,12 @@ fn update_dsh_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<Stri
         }
     }
     if wait_for_port(port, Duration::from_secs(60)) {
-        if let Ok(parsed) = url::Url::parse(url) {
-            if let Some(content) = app.get_webview("harness-content") {
-                let _ = content.navigate(parsed);
+        // The restarted process has a new token; resolve it before navigating.
+        if let Some(u) = ensure_auth_url(app, port) {
+            if let Ok(parsed) = url::Url::parse(&u) {
+                if let Some(content) = app.get_webview("harness-content") {
+                    let _ = content.navigate(parsed);
+                }
             }
         }
     }
@@ -1329,7 +1533,7 @@ fn setup_error(
 /// server and navigate to it. Runs on a background thread and publishes live
 /// progress to the loading page (`setup-progress` / `setup-log`). Guarded by
 /// SetupRunning so only one run is active at a time.
-fn setup_and_start(app: tauri::AppHandle, port: u16, url: String) {
+fn setup_and_start(app: tauri::AppHandle, port: u16) {
     {
         let st = app.state::<SetupRunning>();
         let mut guard = st.0.lock().unwrap();
@@ -1338,29 +1542,40 @@ fn setup_and_start(app: tauri::AppHandle, port: u16, url: String) {
         }
         *guard = true;
     }
-    let ok = setup_and_start_inner(&app, port, &url).is_ok();
+    let ok = setup_and_start_inner(&app, port).is_ok();
     *app.state::<SetupRunning>().0.lock().unwrap() = false;
     // 自动更新设置勾选时:启动就绪后后台检查并更新 dsh / 桌面程序。
     if ok {
-        maybe_auto_update(app, port, url);
+        maybe_auto_update(app, port);
     }
 }
 
-fn setup_and_start_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result<(), String> {
+fn setup_and_start_inner(app: &tauri::AppHandle, port: u16) -> Result<(), String> {
     let mut state = default_setup_state();
 
-    // Fast path: dsh is already running on the port — just connect.
+    // Fast path: dsh is already running on the port — connect, resolving the
+    // per-process access token from the log / persisted URL; when none is
+    // valid, restart the service so we own it and can read its token.
     if port_open(port) {
-        setup_log(app, "检测到 dsh 服务已在运行，直接连接…");
+        setup_log(app, "检测到 dsh 服务已在运行，连接中…");
         set_setup_item(&mut state, "webview2", "ok", "已就绪");
         set_setup_item(&mut state, "node", "ok", "已就绪");
         set_setup_item(&mut state, "dsh", "ok", "已就绪");
         set_setup_item(&mut state, "service", "installed", format!("http://127.0.0.1:{port}"));
-        state.phase = "ready".into();
-        state.message = "启动完成".into();
-        publish_setup(app, state.clone());
-        navigate_to(app, url);
-        return Ok(());
+        return match ensure_auth_url(app, port) {
+            Some(u) => {
+                state.phase = "ready".into();
+                state.message = "启动完成".into();
+                publish_setup(app, state.clone());
+                navigate_to(app, &u);
+                Ok(())
+            }
+            None => {
+                let msg = "无法获取 dsh 访问令牌".to_string();
+                setup_log(app, format!("  {msg}"));
+                setup_error(app, state, "service", "dsh 服务启动失败", msg)
+            }
+        };
     }
 
     publish_setup(app, state.clone());
@@ -1443,12 +1658,23 @@ fn setup_and_start_inner(app: &tauri::AppHandle, port: u16, url: &str) -> Result
     if wait_server_ready(app, port, Duration::from_secs(180)) {
         setup_log(app, format!("  服务已就绪(http://127.0.0.1:{port})"));
         set_setup_item(&mut state, "service", "installed", format!("http://127.0.0.1:{port}"));
-        state.phase = "ready".into();
-        state.message = "启动完成".into();
-        state.progress = None;
-        publish_setup(app, state.clone());
-        navigate_to(app, url);
-        Ok(())
+        // Resolve the authenticated URL (the `dsh web:` token line) before
+        // navigating; without the token the new dsh returns 401.
+        match ensure_auth_url(app, port) {
+            Some(u) => {
+                state.phase = "ready".into();
+                state.message = "启动完成".into();
+                state.progress = None;
+                publish_setup(app, state.clone());
+                navigate_to(app, &u);
+                Ok(())
+            }
+            None => {
+                let msg = "无法获取 dsh 访问令牌".to_string();
+                setup_log(app, format!("  {msg}"));
+                setup_error(app, state, "service", "dsh 服务启动失败", msg)
+            }
+        }
     } else {
         let tail = log_tail(port, 10);
         let msg = if tail.is_empty() {
@@ -1474,8 +1700,7 @@ fn retry_setup(app: tauri::AppHandle) {
         return;
     }
     let port = active_port();
-    let url = server_url(port);
-    std::thread::spawn(move || setup_and_start(app, port, url));
+    std::thread::spawn(move || setup_and_start(app, port));
 }
 
 /// Current setup state snapshot (loading page restores it on load / retry).
@@ -1875,7 +2100,7 @@ fn npm_latest_dsh() -> String {
 /// to the latest npm version and, when a strictly-newer desktop release
 /// exists, download + replace + relaunch the app. Stays silent when everything
 /// is current; only real updates (or dsh failures) surface a toast.
-fn maybe_auto_update(app: tauri::AppHandle, port: u16, url: String) {
+fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
     if !load_settings(&app).auto_update {
         return;
     }
@@ -1926,7 +2151,7 @@ fn maybe_auto_update(app: tauri::AppHandle, port: u16, url: String) {
             _ => false,
         };
         if should_update_dsh {
-            match update_dsh_inner(&app, port, &url) {
+            match update_dsh_inner(&app, port) {
                 Ok(msg) => {
                     publish_update_state(
                         &app,
@@ -1948,7 +2173,6 @@ fn maybe_auto_update(app: tauri::AppHandle, port: u16, url: String) {
 
 pub fn run() {
     let port = active_port();
-    let url = server_url(port);
 
     // --- pre-flight (before any webview can exist): ensure WebView2 ---
     // Without the WebView2 runtime no webview can be created, so this must
@@ -2070,8 +2294,7 @@ pub fn run() {
             // install / start is published to it via `setup-progress` /
             // `setup-log`, so a beginner sees live progress and details, and on
             // failure gets an actionable error with a retry button.
-            let url_for_thread = url.clone();
-            std::thread::spawn(move || setup_and_start(app_handle.clone(), port, url_for_thread));
+            std::thread::spawn(move || setup_and_start(app_handle.clone(), port));
 
             Ok(())
         })
@@ -2112,5 +2335,55 @@ mod tests {
         // unknown keys are ignored
         set_setup_item(&mut s, "nope", "failed", "x");
         assert_eq!(s.items.len(), 4);
+    }
+
+    #[test]
+    fn parse_auth_url_with_token() {
+        let text = "dsh web: http://127.0.0.1:3080/?token=i3HBr4uQ02tqKGThX5h0dGSzdqDEYxQODB5e8gAYmOc\n";
+        assert_eq!(
+            parse_auth_url(text),
+            Some("http://127.0.0.1:3080/?token=i3HBr4uQ02tqKGThX5h0dGSzdqDEYxQODB5e8gAYmOc".into())
+        );
+    }
+
+    #[test]
+    fn parse_auth_url_with_lan_suffix() {
+        let text = "dsh web: http://127.0.0.1:3080/?token=abc (LAN: http://192.168.1.5:3080/?token=abc)\n";
+        assert_eq!(
+            parse_auth_url(text),
+            Some("http://127.0.0.1:3080/?token=abc".into())
+        );
+    }
+
+    #[test]
+    fn parse_auth_url_legacy_no_token() {
+        let text = "dsh web: http://127.0.0.1:3080\n";
+        assert_eq!(parse_auth_url(text), Some("http://127.0.0.1:3080".into()));
+    }
+
+    #[test]
+    fn parse_auth_url_ignores_ansi_and_noise() {
+        let text = "\u{1b}[90mSome npx noise\u{1b}[0m\n\u{1b}[36mdsh web:\u{1b}[0m \u{1b}[1mhttp://127.0.0.1:3080/?token=xyz\u{1b}[0m\n";
+        assert_eq!(
+            parse_auth_url(text),
+            Some("http://127.0.0.1:3080/?token=xyz".into())
+        );
+    }
+
+    #[test]
+    fn parse_auth_url_missing() {
+        assert_eq!(parse_auth_url(""), None);
+        assert_eq!(parse_auth_url("just some output\nno marker here\n"), None);
+        assert_eq!(parse_auth_url("dsh web: no url after marker\n"), None);
+    }
+
+    #[test]
+    fn url_token_extraction() {
+        assert_eq!(
+            url_token("http://127.0.0.1:3080/?token=abc"),
+            Some("abc".into())
+        );
+        assert_eq!(url_token("http://127.0.0.1:3080/"), None);
+        assert_eq!(url_token("not a url"), None);
     }
 }

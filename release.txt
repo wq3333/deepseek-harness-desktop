@@ -1,3 +1,6 @@
+1.0.2
+adapt one-time token authentication
+
 1.0.1
 auto install WebView2/Node.js/dsh 
 auto update dsh/desktop
