@@ -106,12 +106,16 @@
       bottom: 0;
       background: rgba(31, 35, 40, 0.28);
       z-index: 25;
+      /* Fade in only after the bar webview has grown; see openSettings() */
+      opacity: 0;
+      transition: opacity 0.16s ease;
     }
+    #settings-backdrop.visible { opacity: 1; }
     #settings-modal {
       position: fixed;
       top: 50%;
       left: 50%;
-      transform: translate(-50%, -50%);
+      transform: translate(-50%, -46%) scale(0.97);
       width: min(540px, calc(100vw - 48px));
       max-height: calc(100vh - 120px);
       display: flex;
@@ -123,6 +127,12 @@
       z-index: 30;
       padding: 14px 20px 18px;
       overflow: hidden;
+      opacity: 0;
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+    #settings-modal.visible {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
     }
     /* `display: flex` above would otherwise defeat the hidden attribute */
     #settings-modal[hidden] { display: none; }
@@ -511,6 +521,35 @@
       // ---- settings popup (replaces the old 更多 dropdown + about dialog) ----
       var settingsOpen = false;
       window.__settingsOpen = false; // read by showToast to avoid resizing
+      // Pending popup reveal: the popup is shown only after the bar webview
+      // has actually grown to full height (see openSettings/revealSettings).
+      var settingsRevealTimer = null;
+      var settingsRevealHandler = null;
+
+      function cancelSettingsReveal() {
+        if (settingsRevealTimer) { clearTimeout(settingsRevealTimer); settingsRevealTimer = null; }
+        if (settingsRevealHandler) {
+          window.removeEventListener("resize", settingsRevealHandler);
+          settingsRevealHandler = null;
+        }
+      }
+
+      // Make the popup visible and fade it in. Revealing earlier — while the
+      // bar webview is still 44px tall — paints the modal clipped at the top
+      // for a frame or two and then jumps it to center (the open "flash").
+      function revealSettings() {
+        cancelSettingsReveal();
+        var b = document.getElementById("settings-backdrop");
+        var m = document.getElementById("settings-modal");
+        b.hidden = false;
+        m.hidden = false;
+        // Add .visible next frame so the opacity/transform transition runs
+        // from the start state instead of being batched into one paint.
+        requestAnimationFrame(function () {
+          b.classList.add("visible");
+          m.classList.add("visible");
+        });
+      }
 
       function hideToast() {
         var el = document.getElementById("toast");
@@ -519,10 +558,15 @@
         if (!settingsOpen) invoke("set_bar_height", { height: 44 });
       }
       function closeSettings() {
+        cancelSettingsReveal();
         settingsOpen = false;
         window.__settingsOpen = false;
-        document.getElementById("settings-backdrop").hidden = true;
-        document.getElementById("settings-modal").hidden = true;
+        var b = document.getElementById("settings-backdrop");
+        var m = document.getElementById("settings-modal");
+        b.classList.remove("visible");
+        m.classList.remove("visible");
+        b.hidden = true;
+        m.hidden = true;
         invoke("set_bar_height", { height: 44 });
       }
 
@@ -599,9 +643,18 @@
         settingsOpen = true;
         window.__settingsOpen = true;
         hideToast();
-        document.getElementById("settings-backdrop").hidden = false;
-        document.getElementById("settings-modal").hidden = false;
         showTab("settings");
+
+        // Expand the bar webview first, and reveal the popup only once it has
+        // actually grown (one-shot resize listener + safety timer). This
+        // avoids rendering the modal clipped inside the still-44px strip
+        // while the async set_bar_height IPC is in flight.
+        settingsRevealHandler = function () {
+          if (window.innerHeight < 100) return; // still the strip / mid-resize
+          revealSettings();
+        };
+        window.addEventListener("resize", settingsRevealHandler);
+        settingsRevealTimer = setTimeout(revealSettings, 250);
         invoke("set_bar_height", { height: -1 });
 
         // Load persisted settings into the toggles.

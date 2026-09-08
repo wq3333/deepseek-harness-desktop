@@ -833,7 +833,16 @@ fn add_webviews(window: tauri::Window, app_handle: tauri::AppHandle) -> tauri::R
         tauri::webview::WebviewBuilder::new(
             "chat-content",
             tauri::WebviewUrl::External(url::Url::parse(CHAT_URL).unwrap()),
-        ),
+        )
+        // <a target="_blank"> / window.open() links: open in the system
+        // browser instead of being silently dropped (wry cancels every new
+        // window request when no handler is registered).
+        .on_new_window(move |url, _features| {
+            if matches!(url.scheme(), "http" | "https") {
+                open_in_browser(url.as_str());
+            }
+            tauri::webview::NewWindowResponse::Deny
+        }),
         tauri::LogicalPosition::new(0.0, TITLE_BAR_HEIGHT),
         tauri::LogicalSize::new(width, content_h),
     )?;
@@ -848,7 +857,29 @@ fn add_webviews(window: tauri::Window, app_handle: tauri::AppHandle) -> tauri::R
         // before its first paint or during the loading -> dsh navigation
         // (WebView2 would otherwise show white). The window itself carries the
         // same background_color, so the pre-paint gap is seamless too.
-        .background_color(tauri::window::Color(246, 248, 250, 255)),
+        .background_color(tauri::window::Color(246, 248, 250, 255))
+        // External links open in the system browser; only the dsh server
+        // origin and the app's own assets are allowed to navigate in-webview,
+        // so clicking a link never kicks the user out of the Harness GUI.
+        .on_navigation({
+            let port = active_port();
+            move |url| {
+                if is_internal_url(url, port) {
+                    true
+                } else {
+                    open_in_browser(url.as_str());
+                    false
+                }
+            }
+        })
+        // <a target="_blank"> / window.open() links: same treatment as plain
+        // navigation — open in the browser, never create a new webview window.
+        .on_new_window(move |url, _features| {
+            if matches!(url.scheme(), "http" | "https") {
+                open_in_browser(url.as_str());
+            }
+            tauri::webview::NewWindowResponse::Deny
+        }),
         tauri::LogicalPosition::new(0.0, TITLE_BAR_HEIGHT),
         tauri::LogicalSize::new(width, content_h),
     )?;
@@ -1813,25 +1844,50 @@ fn get_app_info(app: tauri::AppHandle) -> AppInfo {
 }
 
 /// Open an external URL in the system default browser (used by the repo link
-/// in the 关于 dialog). The bar webview itself never navigates away.
-#[tauri::command]
-fn open_url(url: String) {
+/// in the 关于 dialog and by the content webviews' external-link handlers).
+fn open_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let quoted = format!("{url}");
         let _ = Command::new("cmd")
-            .args(["/c", "start", "", &quoted])
+            .args(["/c", "start", "", url])
             .creation_flags(0x0800_0000)
             .spawn();
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").arg(&url).spawn();
+        let _ = Command::new("open").arg(url).spawn();
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = Command::new("xdg-open").arg(&url).spawn();
+        let _ = Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// Open an external URL in the system default browser (title bar About dialog
+/// repo link). The bar webview itself never navigates away.
+#[tauri::command]
+fn open_url(url: String) {
+    open_in_browser(&url);
+}
+
+/// True when `url` is safe to load inside the app's own webviews:
+/// the dsh server origin (`127.0.0.1` / `localhost` on the active port —
+/// including the tokenized `?token=` URL dsh redirects to) and the app's own
+/// local assets (`http://tauri.localhost/...`). Any other http(s) URL is
+/// treated as external and handed to the system browser instead. Non-http(s)
+/// URLs (`data:`, `blob:`, `about:`, `tauri://`, ...) always stay in-webview.
+fn is_internal_url(url: &url::Url, port: u16) -> bool {
+    if matches!(url.scheme(), "http" | "https") {
+        match url.host_str() {
+            Some("tauri.localhost") => true,
+            Some("127.0.0.1") | Some("localhost") => {
+                url.port().map_or(true, |p| p == port)
+            }
+            _ => false,
+        }
+    } else {
+        true
     }
 }
 
@@ -2385,5 +2441,52 @@ mod tests {
         );
         assert_eq!(url_token("http://127.0.0.1:3080/"), None);
         assert_eq!(url_token("not a url"), None);
+    }
+
+    #[test]
+    fn is_internal_url_accepts_dsh_server() {
+        // Tokenized URL the harness webview is navigated to at startup.
+        let u = url::Url::parse("http://127.0.0.1:3080/?token=abc").unwrap();
+        assert!(is_internal_url(&u, 3080));
+        // Same-origin SPA routes.
+        let u = url::Url::parse("http://127.0.0.1:3080/some/route").unwrap();
+        assert!(is_internal_url(&u, 3080));
+        // localhost alias (dsh may redirect to it).
+        let u = url::Url::parse("http://localhost:3080/?token=abc").unwrap();
+        assert!(is_internal_url(&u, 3080));
+    }
+
+    #[test]
+    fn is_internal_url_accepts_app_assets() {
+        let u = url::Url::parse("http://tauri.localhost/loading.html").unwrap();
+        assert!(is_internal_url(&u, 3080));
+        let u = url::Url::parse("http://tauri.localhost/loading.html?mode=stopped").unwrap();
+        assert!(is_internal_url(&u, 3080));
+    }
+
+    #[test]
+    fn is_internal_url_rejects_external() {
+        let u = url::Url::parse("https://github.com/wq3333/deepseek-harness-desktop").unwrap();
+        assert!(!is_internal_url(&u, 3080));
+        let u = url::Url::parse("https://chat.deepseek.com").unwrap();
+        assert!(!is_internal_url(&u, 3080));
+    }
+
+    #[test]
+    fn is_internal_url_rejects_wrong_port_or_host() {
+        // Same local hosts, different port.
+        let u = url::Url::parse("http://127.0.0.1:9999/x").unwrap();
+        assert!(!is_internal_url(&u, 3080));
+        let u = url::Url::parse("http://localhost:9999/x").unwrap();
+        assert!(!is_internal_url(&u, 3080));
+        // Loopback host on the right port, but not our server's.
+        let u = url::Url::parse("http://192.168.1.5:3080/?token=abc").unwrap();
+        assert!(!is_internal_url(&u, 3080));
+    }
+
+    #[test]
+    fn is_internal_url_allows_non_http_schemes() {
+        assert!(is_internal_url(&url::Url::parse("about:blank").unwrap(), 3080));
+        assert!(is_internal_url(&url::Url::parse("data:text/plain,hi").unwrap(), 3080));
     }
 }

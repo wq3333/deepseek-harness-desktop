@@ -1,3 +1,6 @@
+1.0.3
+open external <a> links in system default browser
+
 1.0.2
 adapt one-time token authentication
 
