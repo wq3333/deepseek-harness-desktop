@@ -1322,9 +1322,14 @@ fn add_webviews(
 /// Resize the title bar webview to a given height. `height <= 0` means the
 /// full window height (used by the settings popup); otherwise it is clamped
 /// to `[TITLE_BAR_HEIGHT, window height]` (a small height is used for toasts).
-/// When the webview shrinks (popup/toast closing), it is hidden for the
-/// resize and re-shown at the final size, so the compositor never paints the
-/// shrinking transparent full-window surface (the source of the close hitch).
+///
+/// The webview is resized in place (no hide/show around a shrink). The JS
+/// caller hides the popup/toast DOM (`#settings-modal`, `#settings-backdrop`,
+/// the fading `#toast`) before invoking a shrink, so the webview's visible
+/// content is just the opaque 44px title strip — resizing it down repaints
+/// that strip without any intermediate frame where the header disappears.
+/// The previous hide→resize→show sequence made the whole bar webview vanish
+/// for a frame or two on close, which showed up as a title-bar flicker.
 #[tauri::command]
 fn set_bar_height(app: tauri::AppHandle, height: f64) {
     let Some(bar) = app.get_webview("bar") else {
@@ -1348,22 +1353,10 @@ fn set_bar_height(app: tauri::AppHandle, height: f64) {
     };
     let bar_height_state = app.state::<BarHeight>();
     let mut bar_height = bar_height_state.0.lock().unwrap();
-    let shrinking = h < *bar_height;
     *bar_height = h;
     drop(bar_height);
-    // Shrinking the transparent full-window webview back to the title strip
-    // makes WebView2 recomposite the whole surface, which can visibly hitch
-    // right after the settings popup fades out. Resize while hidden and show
-    // again at the final size in the same synchronous command, so the shrink
-    // is never painted.
-    if shrinking {
-        let _ = bar.hide();
-    }
     let _ = bar.set_position(tauri::LogicalPosition::new(0.0, 0.0));
     let _ = bar.set_size(tauri::LogicalSize::new(ls.width, h));
-    if shrinking {
-        let _ = bar.show();
-    }
 }
 
 /// Switch which content webview is visible (harness dsh GUI vs chat web).
@@ -1419,12 +1412,21 @@ fn toggle_devtools(app: tauri::AppHandle) {
 
 /// Exit the whole app. When the "关闭窗口时关闭 dsh 服务" setting is enabled,
 /// also stop the DSH server first (used by the title bar X, Alt+F4 and quit).
+/// `stop_dsh` runs `netstat`/`taskkill`, which block for a few hundred ms, so
+/// it is moved to a background thread and the process exits from there —
+/// never freezing the UI (or the closing window) while waiting.
 fn quit_app(app: &tauri::AppHandle) {
     flush_window_state(app);
     if load_settings(app).close_stops_dsh {
-        stop_dsh(app, active_port());
+        let app = app.clone();
+        let port = active_port();
+        std::thread::spawn(move || {
+            stop_dsh(&app, port);
+            app.exit(0);
+        });
+    } else {
+        app.exit(0);
     }
-    app.exit(0);
 }
 
 /// Exit the whole app (title bar X button). The DSH server is stopped before
@@ -1447,12 +1449,16 @@ fn stop_dsh(app: &tauri::AppHandle, port: u16) {
 }
 
 /// Stop the DSH server, then quit the app (更多菜单 -> "关闭 dsh 并退出").
+/// The netstat/taskkill work runs on a background thread so quitting is not
+/// delayed by a frozen UI.
 #[tauri::command]
 fn quit_with_dsh(app: tauri::AppHandle) {
     flush_window_state(&app);
     let port = active_port();
-    stop_dsh(&app, port);
-    app.exit(0);
+    std::thread::spawn(move || {
+        stop_dsh(&app, port);
+        app.exit(0);
+    });
 }
 
 /// Restart the DSH server and refresh the harness view
@@ -1507,16 +1513,20 @@ fn show_toast(app: &tauri::AppHandle, message: impl Into<String>) {
 
 /// Stop the DSH server but keep the window open (更多 -> "关闭 dsh"). The
 /// harness view is pointed at a neutral "stopped" page so it doesn't show a
-/// broken connection error.
+/// broken connection error. The netstat/taskkill work runs on a background
+/// thread so the click never stutters.
 #[tauri::command(rename = "stop_dsh")]
 fn stop_dsh_cmd(app: tauri::AppHandle) {
     let port = active_port();
-    stop_dsh(&app, port);
-    if let Some(content) = app.get_webview("harness-content") {
-        let _ = content
-            .navigate(url::Url::parse("http://tauri.localhost/loading.html?mode=stopped").unwrap());
-    }
-    show_toast(&app, "dsh 服务已停止");
+    std::thread::spawn(move || {
+        stop_dsh(&app, port);
+        if let Some(content) = app.get_webview("harness-content") {
+            let _ = content.navigate(
+                url::Url::parse("http://tauri.localhost/loading.html?mode=stopped").unwrap(),
+            );
+        }
+        show_toast(&app, "dsh 服务已停止");
+    });
 }
 
 /// Spawn a PowerShell script file as a hidden background process, redirecting
@@ -2256,12 +2266,24 @@ struct AppInfo {
     dsh_version: Option<String>,
 }
 
+/// Resolve the installed dsh version for the 关于 panel. `npm ls -g` spawns a
+/// child process that can take a second or more, so it must never run on the
+/// main thread — this command is async and resolves it on a blocking thread.
+/// The version cell then fills in a moment later; the panel stays responsive
+/// in the meantime (a sync command here used to freeze the whole UI every
+/// time the settings popup was opened).
 #[tauri::command]
-fn get_app_info(app: tauri::AppHandle) -> AppInfo {
+async fn get_app_info(app: tauri::AppHandle) -> AppInfo {
+    let version = app.package_info().version.to_string();
+    let repo = GITHUB_REPO.to_string();
+    let dsh = tauri::async_runtime::spawn_blocking(dsh_version)
+        .await
+        .ok()
+        .flatten();
     AppInfo {
-        version: app.package_info().version.to_string(),
-        repo: GITHUB_REPO.to_string(),
-        dsh_version: dsh_version(),
+        version,
+        repo,
+        dsh_version: dsh,
     }
 }
 
@@ -2649,14 +2671,47 @@ fn npm_latest_dsh() -> String {
         .to_string()
 }
 
+/// Completion flags shared by the two startup auto-update threads, so the
+/// thread that finishes last can show one confirmation toast instead of the
+/// flow staying completely silent when everything is current.
+struct AutoUpdateFlags {
+    dsh_done: std::sync::atomic::AtomicBool,
+    app_done: std::sync::atomic::AtomicBool,
+    updated: std::sync::atomic::AtomicBool,
+}
+
+/// Last-finishing thread's epilogue: once BOTH the dsh and the desktop-app
+/// checks have settled, show a single "已是最新版本" toast — but only when
+/// neither target was updated (their own flow toasts already informed the
+/// user) and neither check failed (startup network failures stay quiet; the
+/// 关于 panel still shows the error state).
+fn maybe_auto_summary(app: &tauri::AppHandle, flags: &AutoUpdateFlags) {
+    use std::sync::atomic::Ordering;
+    if !(flags.dsh_done.load(Ordering::SeqCst) && flags.app_done.load(Ordering::SeqCst)) {
+        return;
+    }
+    if flags.updated.load(Ordering::SeqCst) {
+        return;
+    }
+    let st = app.state::<SharedAboutState>().0.lock().unwrap().clone();
+    if st.dsh.phase == "done" && st.app.phase == "done" {
+        show_toast(app, "自动更新检查完成，dsh 与桌面版均为最新版本");
+    }
+}
+
 /// Startup auto-update (自动更新 setting): check + update dsh (npm) and the
 /// desktop app (GitHub release) in parallel background threads, so neither
 /// target is ever skipped by the other. The desktop-app self update normally
 /// ends by exiting the process (the detached helper swaps the exe), so its
 /// final exit waits for the dsh flow to settle first — otherwise the process
-/// exit would cut a concurrent dsh npm install / server restart short. Stays
-/// silent when everything is current; only real updates (or dsh failures)
-/// surface a toast.
+/// exit would cut a concurrent dsh npm install / server restart short.
+///
+/// Unlike the manual 关于 checks, startup runs stay quiet on transient
+/// network failures (no toast) — but every step is still published to the
+/// `about-progress` state, so the 关于 panel shows "正在检查…" → "已是最新
+/// 版本" / "发现新版本" / error. When everything is current, the last
+/// finishing thread shows a single confirmation toast; real updates (or
+/// install failures) surface their own toasts as before.
 fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
     if !load_settings(&app).auto_update {
         return;
@@ -2668,20 +2723,43 @@ fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
         return;
     }
 
-    // Set once the dsh check/update flow has fully finished. The desktop-app
-    // thread waits on it before exiting the process, so the self-update
-    // restart never interrupts a dsh update that is still in flight.
-    let dsh_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Completion flags: dsh_done/app_done are set once each flow has fully
+    // finished; updated records whether any target was actually updated. The
+    // desktop-app thread waits on dsh_done before exiting the process, so the
+    // self-update restart never interrupts a dsh update that is still in
+    // flight.
+    let flags = std::sync::Arc::new(AutoUpdateFlags {
+        dsh_done: std::sync::atomic::AtomicBool::new(false),
+        app_done: std::sync::atomic::AtomicBool::new(false),
+        updated: std::sync::atomic::AtomicBool::new(false),
+    });
 
     // Thread A: dsh (npm) — update when not installed yet or when a newer
     // version exists. Runs fully independently of the desktop-app update.
     {
         let app = app.clone();
-        let done = dsh_done.clone();
+        let flags = flags.clone();
         std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            update_target(&app, "dsh", |t| {
+                t.phase = "checking".into();
+                t.message = "正在检查 dsh 更新…".into();
+                t.progress = None;
+                t.error = None;
+            });
             let current = dsh_version();
             let latest = npm_latest_dsh();
-            if dsh_should_update(current.as_deref(), &latest) {
+            if latest.is_empty() {
+                // npm query failed (typically offline): publish the failure to
+                // the 关于 panel but stay quiet — a network blip at startup
+                // must not alarm the user.
+                update_target(&app, "dsh", |t| {
+                    t.phase = "error".into();
+                    t.error = Some("无法获取最新版本".into());
+                    t.message = "检查 dsh 更新失败:无法获取最新版本".into();
+                });
+            } else if dsh_should_update(current.as_deref(), &latest) {
+                flags.updated.store(true, Ordering::SeqCst);
                 match update_dsh_inner(&app, port) {
                     Ok(msg) => {
                         update_target(&app, "dsh", |t| {
@@ -2702,18 +2780,37 @@ fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
                         show_toast(&app, format!("自动更新 dsh 失败:{e}"));
                     }
                 }
+            } else {
+                let msg = format!("已是最新版本 v{}", current.as_deref().unwrap_or("?"));
+                update_target(&app, "dsh", |t| {
+                    t.phase = "done".into();
+                    t.current = current;
+                    t.latest = Some(latest);
+                    t.update_available = false;
+                    t.message = msg;
+                    t.error = None;
+                });
             }
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            flags.dsh_done.store(true, Ordering::SeqCst);
+            maybe_auto_summary(&app, &flags);
         });
     }
 
     // Thread B: desktop app (GitHub release) — update only when strictly newer.
     std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        update_target(&app, "app", |t| {
+            t.phase = "checking".into();
+            t.message = "正在检查桌面版更新…".into();
+            t.progress = None;
+            t.error = None;
+        });
         match fetch_latest_release() {
             Ok(release) => {
                 let current = app.package_info().version.to_string();
                 let latest_raw = release.tag_name.trim().trim_start_matches('v').to_string();
                 if app_should_update(&current, &latest_raw) {
+                    flags.updated.store(true, Ordering::SeqCst);
                     show_toast(&app, "发现新版本，正在后台更新应用…");
                     // Download first (this process must stay alive while the
                     // concurrent dsh update runs), then wait for dsh to settle
@@ -2727,6 +2824,8 @@ fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
                                 t.message = format!("自动更新应用失败:{e}");
                             });
                             show_toast(&app, format!("自动更新应用失败:{e}"));
+                            flags.app_done.store(true, Ordering::SeqCst);
+                            maybe_auto_summary(&app, &flags);
                             return;
                         }
                     };
@@ -2734,7 +2833,7 @@ fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
                     // app restart forever; an interrupted dsh update is
                     // retried on the next launch.
                     let wait_deadline = std::time::Instant::now() + Duration::from_secs(600);
-                    while !dsh_done.load(std::sync::atomic::Ordering::SeqCst)
+                    while !flags.dsh_done.load(Ordering::SeqCst)
                         && std::time::Instant::now() < wait_deadline
                     {
                         std::thread::sleep(Duration::from_millis(200));
@@ -2748,9 +2847,30 @@ fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
                         show_toast(&app, format!("自动更新应用失败:{e}"));
                     }
                     // finalize_app_update ends with app.exit(0) on success.
+                } else {
+                    let msg = format!("已是最新版本 v{current}");
+                    update_target(&app, "app", |t| {
+                        t.phase = "done".into();
+                        t.current = Some(current);
+                        t.latest = Some(latest_raw);
+                        t.update_available = false;
+                        t.message = msg;
+                        t.error = None;
+                    });
                 }
+                flags.app_done.store(true, Ordering::SeqCst);
+                maybe_auto_summary(&app, &flags);
             }
-            Err(_) => {} // 启动时网络失败保持安静
+            Err(e) => {
+                // 启动时网络失败保持安静(仅发布 error 状态到关于面板)
+                update_target(&app, "app", |t| {
+                    t.phase = "error".into();
+                    t.error = Some(e.clone());
+                    t.message = format!("检查桌面版更新失败:{e}");
+                });
+                flags.app_done.store(true, Ordering::SeqCst);
+                maybe_auto_summary(&app, &flags);
+            }
         }
     });
 }
