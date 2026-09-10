@@ -27,6 +27,25 @@ const GITHUB_LATEST_API: &str =
 /// Height (logical px) of the custom title bar.
 const TITLE_BAR_HEIGHT: f64 = 44.0;
 
+/// Window / harness-content background color in light theme — matches the
+/// title bar and loading page so there is never a white flash before paint.
+const LIGHT_BG: tauri::window::Color = tauri::window::Color(246, 248, 250, 255);
+/// Same for dark theme (GitHub-dark content background).
+const DARK_BG: tauri::window::Color = tauri::window::Color(13, 17, 23, 255);
+
+/// Minimum logical window size when restoring a persisted geometry.
+const MIN_WINDOW_W: f64 = 800.0;
+const MIN_WINDOW_H: f64 = 600.0;
+
+/// How long window move/resize events are debounced before writing the
+/// geometry to disk (they fire many times per second while dragging).
+const GEOMETRY_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// The saved window rectangle must overlap some monitor by at least this many
+/// physical pixels on both axes to be considered reachable after restore
+/// (otherwise the window would open off-screen with no grabbable title bar).
+const GEOMETRY_VISIBLE_MARGIN: f64 = 48.0;
+
 /// WebView2 Evergreen runtime bootstrapper download URL (used for the
 /// automatic WebView2 installation in the native pre-flight phase).
 const WEBVIEW2_BOOTSTRAPPER_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
@@ -102,11 +121,16 @@ struct SetupRunning(Mutex<bool>);
 /// User-adjustable settings persisted to `settings.json` in the app data dir.
 /// - `close_stops_dsh`: stop the DSH server when the window closes (default off).
 /// - `auto_update`: at startup check + update dsh and the desktop app (default on).
+/// - `theme`: "light" | "dark" | "system" (follow the OS; default).
+///
+/// `#[serde(default)]` keeps old settings.json files (without `theme`) fully
+/// readable, so upgrading never resets an existing user's preferences.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 struct Settings {
     close_stops_dsh: bool,
     auto_update: bool,
+    theme: String,
 }
 
 impl Default for Settings {
@@ -114,6 +138,7 @@ impl Default for Settings {
         Settings {
             close_stops_dsh: false,
             auto_update: true,
+            theme: "system".into(),
         }
     }
 }
@@ -127,11 +152,18 @@ fn settings_path(app: &tauri::AppHandle) -> std::path::PathBuf {
         .join("settings.json")
 }
 
+/// Read a UTF-8 text file, tolerating a leading UTF-8 BOM (some editors and
+/// PowerShell's `Set-Content -Encoding UTF8` add one, which would otherwise
+/// break serde_json parsing of the whole file).
+fn read_text_utf8(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
 /// Read the persisted settings; any read/parse failure falls back to defaults
 /// so a missing or corrupt file never breaks startup.
 fn load_settings(app: &tauri::AppHandle) -> Settings {
-    std::fs::read_to_string(settings_path(app))
-        .ok()
+    read_text_utf8(&settings_path(app))
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
 }
@@ -143,12 +175,288 @@ fn get_settings(app: tauri::AppHandle) -> Settings {
 
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
+    let old = load_settings(&app);
     let path = settings_path(&app);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("创建设置目录失败:{e}"))?;
     }
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("写入设置失败:{e}"))
+    std::fs::write(&path, json).map_err(|e| format!("写入设置失败:{e}"))?;
+    // A theme change applies immediately to the window and every webview.
+    if old.theme != settings.theme {
+        apply_theme(&app);
+    }
+    Ok(())
+}
+
+// --- 主题 (theme: light / dark / follow system) ---
+
+/// Map the persisted theme setting to a concrete light/dark value.
+/// "system" follows the OS theme reported by Tauri (`Window::theme`).
+fn resolve_theme(setting: &str, os: tauri::Theme) -> &'static str {
+    match setting {
+        "light" => "light",
+        "dark" => "dark",
+        _ => match os {
+            tauri::Theme::Dark => "dark",
+            _ => "light",
+        },
+    }
+}
+
+/// Background color matching a resolved theme value.
+fn theme_bg(theme: &str) -> tauri::window::Color {
+    if theme == "dark" {
+        DARK_BG
+    } else {
+        LIGHT_BG
+    }
+}
+
+/// JS snippet applying a resolved theme to the current document: it drives
+/// `color-scheme` (so embedded pages matching `prefers-color-scheme` follow)
+/// and sets `data-dsh-theme` on `<html>` (which the title bar and loading
+/// page use in their CSS). Used both by runtime `eval` and baked into init
+/// scripts.
+fn theme_apply_js(theme: &str) -> String {
+    let v = if theme == "dark" { "'dark'" } else { "'light'" };
+    format!(
+        "(function(t){{var d=document.documentElement;d.style.colorScheme=t;d.setAttribute('data-dsh-theme',t);}})({v})"
+    )
+}
+
+/// Static init-script form of the theme (no closure), baked into webviews so
+/// the very first paint of a page is already themed.
+fn theme_init_script(theme: &str) -> String {
+    let v = if theme == "dark" { "dark" } else { "light" };
+    format!(
+        "document.documentElement.style.colorScheme='{v}';document.documentElement.setAttribute('data-dsh-theme','{v}');"
+    )
+}
+
+/// Resolved theme for the app's main window right now (setting + OS theme).
+fn current_theme(app: &tauri::AppHandle) -> &'static str {
+    let setting = load_settings(app).theme;
+    let os = app
+        .get_window("main")
+        .and_then(|w| w.theme().ok())
+        .unwrap_or(tauri::Theme::Light);
+    resolve_theme(&setting, os)
+}
+
+/// Re-apply the current theme to the window and all three webviews. Called on
+/// a settings change and on OS theme changes while in "system" mode. The bar
+/// webview is transparent (it stretches over the content), so only the window
+/// and the two content webviews get an opaque background color.
+fn apply_theme(app: &tauri::AppHandle) {
+    let theme = current_theme(app);
+    let bg = theme_bg(theme);
+    if let Some(window) = app.get_window("main") {
+        let _ = window.set_background_color(Some(bg));
+    }
+    for label in ["harness-content", "chat-content"] {
+        if let Some(wv) = app.get_webview(label) {
+            let _ = wv.set_background_color(Some(bg));
+            let _ = wv.eval(theme_apply_js(theme));
+        }
+    }
+    if let Some(bar) = app.get_webview("bar") {
+        let _ = bar.eval(theme_apply_js(theme));
+    }
+}
+
+/// Apply the current theme to a single webview (used by the page-load hook so
+/// every finished navigation — loading -> dsh, chat first load — re-applies
+/// the latest theme). `with_background` is false for the transparent bar.
+fn apply_theme_to_webview(webview: &tauri::Webview, app: &tauri::AppHandle, with_background: bool) {
+    let theme = current_theme(app);
+    if with_background {
+        let _ = webview.set_background_color(Some(theme_bg(theme)));
+    }
+    let _ = webview.eval(theme_apply_js(theme));
+}
+
+// --- 窗口状态 (window position / size, persisted to window-state.json) ---
+
+/// Persisted window geometry (`window-state.json`), all values in logical
+/// pixels. Written by Rust only, so saving user settings never touches it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WindowState {
+    maximized: bool,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        WindowState {
+            maximized: false,
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        }
+    }
+}
+
+/// Pending window geometry + time of the last disk write (debounced).
+struct WindowStateCache {
+    pending: Option<WindowState>,
+    last_saved: Option<Instant>,
+}
+
+/// Shared window-geometry cache, managed by Tauri.
+struct WindowStateStore(Mutex<WindowStateCache>);
+
+fn window_state_path(app: &tauri::AppHandle) -> std::path::PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("window-state.json")
+}
+
+fn load_window_state(app: &tauri::AppHandle) -> Option<WindowState> {
+    let text = read_text_utf8(&window_state_path(app))?;
+    let state: WindowState = serde_json::from_str(&text).ok()?;
+    Some(state)
+}
+
+fn save_window_state(app: &tauri::AppHandle, state: &WindowState) {
+    let path = window_state_path(app);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(state) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// True when a window rectangle (logical coords, relative to the virtual
+/// desktop origin, scaled by `scale`) overlaps at least one monitor rect
+/// (physical) by `margin` px on both axes — i.e. the title bar stays
+/// grabbable after restore. Monitors are `(x, y, width, height)`.
+fn rect_visible_on_monitors(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    scale: f64,
+    monitors: &[(i32, i32, u32, u32)],
+    margin: f64,
+) -> bool {
+    let rx = x * scale;
+    let ry = y * scale;
+    let rw = w * scale;
+    let rh = h * scale;
+    monitors.iter().any(|&(mx, my, mw, mh)| {
+        let ox = (rx + rw).min((mx + mw as i32) as f64) - rx.max(mx as f64);
+        let oy = (ry + rh).min((my + mh as i32) as f64) - ry.max(my as f64);
+        ox >= margin && oy >= margin
+    })
+}
+
+/// Off-screen guard for restoring a saved position: false when the saved rect
+/// would be unreachable on every connected monitor.
+fn saved_geometry_visible(state: &WindowState, window: &tauri::Window) -> bool {
+    let scale = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.0);
+    let monitors: Vec<(i32, i32, u32, u32)> = window
+        .available_monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(|m| {
+            let p = m.position();
+            let s = m.size();
+            (p.x, p.y, s.width, s.height)
+        })
+        .collect();
+    rect_visible_on_monitors(
+        state.x,
+        state.y,
+        state.width,
+        state.height,
+        scale,
+        &monitors,
+        GEOMETRY_VISIBLE_MARGIN,
+    )
+}
+
+/// Record the window's current geometry into the shared store, writing to
+/// disk at most once per debounce interval. Minimized windows are skipped
+/// (Windows reports a near-zero size for them); a maximized window only flips
+/// the flag so the last known normal bounds survive for the unmaximize case.
+fn record_window_geometry(window: &tauri::Window, app: &tauri::AppHandle) {
+    if window.is_minimized().unwrap_or(true) {
+        return;
+    }
+    let maximized = window.is_maximized().unwrap_or(false);
+    let store = app.state::<WindowStateStore>();
+    let mut cache = store.0.lock().unwrap();
+    let state = cache.pending.get_or_insert_with(WindowState::default);
+    state.maximized = maximized;
+    if !maximized {
+        if let (Ok(pos), Ok(size), Ok(scale)) =
+            (window.outer_position(), window.outer_size(), window.scale_factor())
+        {
+            let scale = scale.max(0.1);
+            state.x = pos.x as f64 / scale;
+            state.y = pos.y as f64 / scale;
+            state.width = size.width as f64 / scale;
+            state.height = size.height as f64 / scale;
+        }
+    }
+    if cache
+        .last_saved
+        .map_or(true, |t| t.elapsed() >= GEOMETRY_SAVE_DEBOUNCE)
+    {
+        if let Some(p) = &cache.pending {
+            save_window_state(app, p);
+        }
+        cache.last_saved = Some(Instant::now());
+    }
+}
+
+/// Final write of the pending geometry (called on every exit path). When the
+/// window is minimized the last good pending state is kept as-is.
+fn flush_window_state(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_window("main") {
+        if !window.is_minimized().unwrap_or(true) {
+            record_window_geometry(&window, app);
+        }
+    }
+    let store = app.state::<WindowStateStore>();
+    let cache = store.0.lock().unwrap();
+    if let Some(p) = &cache.pending {
+        save_window_state(app, p);
+    }
+}
+
+/// Apply the persisted geometry to a (hidden, already built) window: normal
+/// bounds when they are valid, else centered. First run (no state) stays
+/// centered. Returns true when the saved state was maximized — the caller
+/// defers the actual maximize until the first page has finished loading, so
+/// the maximized window never appears empty (no startup flash).
+fn restore_window_geometry(window: &tauri::Window, app: &tauri::AppHandle) -> bool {
+    let Some(state) = load_window_state(app) else {
+        let _ = window.center();
+        return false;
+    };
+    let w = state.width.max(MIN_WINDOW_W);
+    let h = state.height.max(MIN_WINDOW_H);
+    let _ = window.set_size(tauri::LogicalSize::new(w, h));
+    if saved_geometry_visible(&state, window) {
+        let _ = window.set_position(tauri::LogicalPosition::new(state.x, state.y));
+    } else {
+        let _ = window.center();
+    }
+    state.maximized
 }
 
 fn default_setup_items() -> Vec<SetupItem> {
@@ -788,20 +1096,35 @@ fn attach_window_handlers(
     let window_for_layout = window.clone();
     let app_handle_for_layout = app_handle.clone();
     window.on_window_event(move |event| {
-        if matches!(event, tauri::WindowEvent::Resized(_)) {
-            // Skip while minimized: Windows reports a ~19px height for the
-            // minimized window and there is nothing to lay out until restore
-            // (also avoids resizing webviews to a near-zero height).
-            if window_for_layout.is_minimized().unwrap_or(true) {
-                return;
+        match event {
+            tauri::WindowEvent::Resized(_) => {
+                // Persist the geometry (skips minimized / maximized-size races
+                // internally), then re-layout the webviews.
+                record_window_geometry(&window_for_layout, &app_handle_for_layout);
+                // Skip while minimized: Windows reports a ~19px height for the
+                // minimized window and there is nothing to lay out until restore
+                // (also avoids resizing webviews to a near-zero height).
+                if window_for_layout.is_minimized().unwrap_or(true) {
+                    return;
+                }
+                let bar_height = app_handle_for_layout
+                    .state::<BarHeight>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .clone();
+                relayout(&window_for_layout, &bar, &harness, &chat, bar_height);
             }
-            let bar_height = app_handle_for_layout
-                .state::<BarHeight>()
-                .0
-                .lock()
-                .unwrap()
-                .clone();
-            relayout(&window_for_layout, &bar, &harness, &chat, bar_height);
+            tauri::WindowEvent::Moved(_) => {
+                record_window_geometry(&window_for_layout, &app_handle_for_layout);
+            }
+            tauri::WindowEvent::ThemeChanged(_) => {
+                // Only "system" mode follows live OS theme changes.
+                if load_settings(&app_handle_for_layout).theme == "system" {
+                    apply_theme(&app_handle_for_layout);
+                }
+            }
+            _ => {}
         }
     });
     window.on_window_event(move |event| {
@@ -816,7 +1139,55 @@ fn attach_window_handlers(
 /// title bar on top, and the two content webviews (harness / chat) that
 /// toggle visibility below it. chat-content is added first and hidden right
 /// away (it preloads in the background under harness-content).
-fn add_webviews(window: tauri::Window, app_handle: tauri::AppHandle) -> tauri::Result<()> {
+///
+/// `maximize_on_first_paint`: when the saved window state was maximized, the
+/// maximize is deferred until the harness webview finishes loading its first
+/// page (the loading page), so the maximized window always has real content —
+/// no flash of an empty maximized window at startup.
+fn add_webviews(
+    window: tauri::Window,
+    app_handle: tauri::AppHandle,
+    maximize_on_first_paint: bool,
+) -> tauri::Result<()> {
+    // Resolve the theme before any webview exists: it is baked into each
+    // webview's initialization script and background color, so the very first
+    // paint of every page (title bar, loading, dsh, chat) is already themed —
+    // no light->dark flash, and embedded pages that match `prefers-color-scheme`
+    // (driven by the injected `color-scheme`) follow immediately.
+    let theme = current_theme(&app_handle);
+    let bg = theme_bg(theme);
+    let init = theme_init_script(theme);
+    let _ = window.set_background_color(Some(bg));
+
+    // Re-apply the current theme on every finished navigation, so pages that
+    // load later (chat on first switch, a theme change made while a webview
+    // was hidden) still get the latest theme.
+    let page_load_app = app_handle.clone();
+    let page_load_apply = move |webview: tauri::Webview, payload: tauri::webview::PageLoadPayload<'_>| {
+        if payload.event() == tauri::webview::PageLoadEvent::Finished {
+            apply_theme_to_webview(&webview, &page_load_app, true);
+        }
+    };
+
+    // One-shot guard: the harness's first finished page-load triggers the
+    // deferred startup maximize (only once — later navigations must not
+    // re-maximize).
+    let maximize_first =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(maximize_on_first_paint));
+    let harness_maximize = maximize_first.clone();
+    let harness_maximize_window = window.clone();
+    let harness_page_load_app = app_handle.clone();
+    let harness_page_load = move |webview: tauri::Webview, payload: tauri::webview::PageLoadPayload<'_>| {
+        if payload.event() == tauri::webview::PageLoadEvent::Finished {
+            apply_theme_to_webview(&webview, &harness_page_load_app, true);
+            // Maximize only once the first visible page has loaded, so the
+            // window never pops in maximized-but-empty.
+            if harness_maximize.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let _ = harness_maximize_window.maximize();
+            }
+        }
+    };
+
     // Size the webviews from the window's actual logical size instead of a
     // hard-coded 1280x800: the loading page is then centered at the final
     // size from its very first paint, avoiding a one-time "jump" when the
@@ -834,6 +1205,8 @@ fn add_webviews(window: tauri::Window, app_handle: tauri::AppHandle) -> tauri::R
             "chat-content",
             tauri::WebviewUrl::External(url::Url::parse(CHAT_URL).unwrap()),
         )
+        .initialization_script(init.clone())
+        .on_page_load(page_load_apply.clone())
         // <a target="_blank"> / window.open() links: open in the system
         // browser instead of being silently dropped (wry cancels every new
         // window request when no handler is registered).
@@ -853,11 +1226,13 @@ fn add_webviews(window: tauri::Window, app_handle: tauri::AppHandle) -> tauri::R
             "harness-content",
             tauri::WebviewUrl::App("loading.html".into()),
         )
+        .initialization_script(init.clone())
+        .on_page_load(harness_page_load)
         // Match the loading page background so the webview never flashes white
         // before its first paint or during the loading -> dsh navigation
         // (WebView2 would otherwise show white). The window itself carries the
         // same background_color, so the pre-paint gap is seamless too.
-        .background_color(tauri::window::Color(246, 248, 250, 255))
+        .background_color(bg)
         // External links open in the system browser; only the dsh server
         // origin and the app's own assets are allowed to navigate in-webview,
         // so clicking a link never kicks the user out of the Harness GUI.
@@ -888,9 +1263,18 @@ fn add_webviews(window: tauri::Window, app_handle: tauri::AppHandle) -> tauri::R
     // Transparent so that when the "更多" dropdown expands it to the full
     // window height, the content webviews beneath remain visible (the title
     // bar strip itself keeps its own opaque background).
+    let bar_page_load_app = app_handle.clone();
     let bar = window.add_child(
         tauri::webview::WebviewBuilder::new("bar", tauri::WebviewUrl::App("index.html".into()))
             .initialization_script("window.__DSH_TARGET__ = 'harness';")
+            .initialization_script(init)
+            // The bar is transparent: only eval the theme, never paint a
+            // background over the content beneath.
+            .on_page_load(move |webview, payload| {
+                if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                    apply_theme_to_webview(&webview, &bar_page_load_app, false);
+                }
+            })
             .transparent(true),
         tauri::LogicalPosition::new(0.0, 0.0),
         tauri::LogicalSize::new(width, TITLE_BAR_HEIGHT),
@@ -984,6 +1368,7 @@ fn toggle_devtools(app: tauri::AppHandle) {
 /// Exit the whole app. When the "关闭窗口时关闭 dsh 服务" setting is enabled,
 /// also stop the DSH server first (used by the title bar X, Alt+F4 and quit).
 fn quit_app(app: &tauri::AppHandle) {
+    flush_window_state(app);
     if load_settings(app).close_stops_dsh {
         stop_dsh(app, active_port());
     }
@@ -1012,6 +1397,7 @@ fn stop_dsh(app: &tauri::AppHandle, port: u16) {
 /// Stop the DSH server, then quit the app (更多菜单 -> "关闭 dsh 并退出").
 #[tauri::command]
 fn quit_with_dsh(app: tauri::AppHandle) {
+    flush_window_state(&app);
     let port = active_port();
     stop_dsh(&app, port);
     app.exit(0);
@@ -2138,6 +2524,7 @@ fn update_app_inner(app: &tauri::AppHandle) -> Result<(), String> {
     {
         let _ = Command::new("sh").arg(&helper).spawn();
     }
+    flush_window_state(&app);
     app.exit(0);
     Ok(())
 }
@@ -2286,6 +2673,10 @@ pub fn run() {
         .manage(SharedUpdateState(Mutex::new(UpdateState::default())))
         .manage(SetupRunning(Mutex::new(false)))
         .manage(SharedSetupState(Mutex::new(default_setup_state())))
+        .manage(WindowStateStore(Mutex::new(WindowStateCache {
+            pending: None,
+            last_saved: None,
+        })))
         .invoke_handler(tauri::generate_handler![
             switch_to,
             quit,
@@ -2309,29 +2700,26 @@ pub fn run() {
 
             // --- single main window: persistent title bar + two content
             // webviews that are toggled by switch_to ---
-            // No hide-then-show window + page-load-event + wait-thread
-            // trickery: the window is born visible and maximized (tao applies
-            // maximized before show, so there is no restore->maximize jump),
-            // and its background_color matches the loading page + title bar
-            // (#f6f8fa), so the pre-webview-paint gap shows the app color
-            // instead of a white flash. The loading page stays centered at the
-            // final size from its first frame (no startup "jitter").
-            
+            // The window is built hidden and configured (geometry restore +
+            // theme) before the first show, so there is no light->dark flash
+            // and the loading page is centered at the final size from its
+            // very first frame (no startup "jitter"). A saved maximized state
+            // is deferred: add_webviews maximizes only once the first page
+            // has finished loading, so the window never pops in maximized
+            // but empty (no startup flash).
             let window = tauri::window::WindowBuilder::new(app, "main")
                 .title("DeepSeek Harness")
-                .inner_size(1280.0,720.0)
-                .center()
+                .inner_size(1280.0, 720.0)
                 .decorations(false)
                 .resizable(true)
-                .background_color(tauri::window::Color(246, 248, 250, 255))
+                .background_color(LIGHT_BG)
+                .visible(false)
                 .build()?;
-            add_webviews(window.clone(), app_handle.clone())?;
-            // Defensive no-ops: the builder above already created the window
-            // visible and maximized; these only matter if a future change ever
-            // makes the window hidden at build time. The loading page keeps
-            // its card hidden briefly (loading.html setTimeout) then fades it
-            // in — no startup flash, and the loading page stays centered.
-            // let _ = window.maximize();
+            // Restore the last window position / size (or maximize), falling
+            // back to centered defaults on first run or when the saved
+            // position is off-screen (e.g. a monitor was unplugged).
+            let restore_maximized = restore_window_geometry(&window, &app_handle);
+            add_webviews(window.clone(), app_handle.clone(), restore_maximized)?;
             let _ = window.show();
 
             // F12 toggles DevTools on the currently visible content webview.
@@ -2488,5 +2876,85 @@ mod tests {
     fn is_internal_url_allows_non_http_schemes() {
         assert!(is_internal_url(&url::Url::parse("about:blank").unwrap(), 3080));
         assert!(is_internal_url(&url::Url::parse("data:text/plain,hi").unwrap(), 3080));
+    }
+
+    #[test]
+    fn resolve_theme_maps_setting_and_os() {
+        assert_eq!(resolve_theme("light", tauri::Theme::Dark), "light");
+        assert_eq!(resolve_theme("dark", tauri::Theme::Light), "dark");
+        assert_eq!(resolve_theme("system", tauri::Theme::Dark), "dark");
+        assert_eq!(resolve_theme("system", tauri::Theme::Light), "light");
+        // Unknown values fall back to following the OS.
+        assert_eq!(resolve_theme("", tauri::Theme::Dark), "dark");
+        assert_eq!(resolve_theme("banana", tauri::Theme::Light), "light");
+    }
+
+    #[test]
+    fn theme_apply_js_sets_color_scheme_and_attribute() {
+        let dark = theme_apply_js("dark");
+        assert!(dark.contains("'dark'"));
+        assert!(dark.contains("colorScheme"));
+        assert!(dark.contains("data-dsh-theme"));
+        let light = theme_apply_js("light");
+        assert!(light.contains("'light'"));
+    }
+
+    #[test]
+    fn theme_init_script_bakes_resolved_theme() {
+        let init = theme_init_script("dark");
+        assert!(init.starts_with("document.documentElement.style.colorScheme='dark';"));
+        assert!(init.contains("data-dsh-theme','dark'"));
+    }
+
+    #[test]
+    fn window_state_json_round_trip_and_defaults() {
+        let state = WindowState {
+            maximized: true,
+            x: 120.0,
+            y: 80.0,
+            width: 1440.0,
+            height: 900.0,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"maximized\":true"));
+        let back: WindowState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.maximized, true);
+        assert_eq!(back.x, 120.0);
+        assert_eq!(back.width, 1440.0);
+        // Missing fields fall back to defaults (forward/backward compat).
+        let partial: WindowState = serde_json::from_str(r#"{"maximized":true}"#).unwrap();
+        assert!(partial.maximized);
+        assert_eq!(partial.width, 0.0);
+    }
+
+    #[test]
+    fn settings_missing_theme_parses_as_system() {
+        // Old settings.json (before the theme setting existed) must keep all
+        // existing preferences and default the theme to "system".
+        let s: Settings =
+            serde_json::from_str(r#"{"closeStopsDsh":true,"autoUpdate":false}"#).unwrap();
+        assert!(s.close_stops_dsh);
+        assert!(!s.auto_update);
+        assert_eq!(s.theme, "system");
+    }
+
+    #[test]
+    fn rect_visible_on_monitors_matches_expected() {
+        // Two monitors: primary 1920x1080 at (0,0), secondary 2560x1440 at (1920,0).
+        let monitors = [(0i32, 0i32, 1920u32, 1080u32), (1920, 0, 2560, 1440)];
+        // Fully inside the primary.
+        assert!(rect_visible_on_monitors(200.0, 100.0, 1280.0, 720.0, 1.0, &monitors, 48.0));
+        // Fully inside the secondary.
+        assert!(rect_visible_on_monitors(3000.0, 200.0, 1280.0, 720.0, 1.0, &monitors, 48.0));
+        // Off-screen to the left of everything.
+        assert!(!rect_visible_on_monitors(-3000.0, 0.0, 1280.0, 720.0, 1.0, &monitors, 48.0));
+        // Below every monitor.
+        assert!(!rect_visible_on_monitors(0.0, 5000.0, 1280.0, 720.0, 1.0, &monitors, 48.0));
+        // Straddling the seam between the two monitors still counts as visible.
+        assert!(rect_visible_on_monitors(1800.0, 100.0, 1280.0, 720.0, 1.0, &monitors, 48.0));
+        // A 1px sliver of overlap fails the margin requirement.
+        assert!(!rect_visible_on_monitors(1919.5, 0.0, 1.0, 1.0, 1.0, &monitors, 48.0));
+        // Different scale factors convert logical->physical first.
+        assert!(rect_visible_on_monitors(100.0, 50.0, 1280.0, 720.0, 2.0, &monitors, 48.0));
     }
 }

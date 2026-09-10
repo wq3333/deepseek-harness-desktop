@@ -10,10 +10,23 @@
       --fg: #1f2328;
       --muted: #57606a;
       --accent: #0969da;
+      --accent-hover: #0a5fc0;
       --card: #ffffff;
       --border: #d0d7de;
       --ok: #1a7f37;
       --bad: #cf222e;
+    }
+    /* Dark palette, applied by the Rust side via data-dsh-theme on <html> */
+    html[data-dsh-theme="dark"] {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --card: #161b22;
+      --border: #30363d;
+      --ok: #3fb950;
+      --bad: #f85149;
     }
     * { box-sizing: border-box; }
     html, body {
@@ -104,7 +117,7 @@
       appearance: none; border: 0; background: var(--accent); color: #fff;
       font-size: 13px; padding: 7px 20px; border-radius: 6px; cursor: pointer;
     }
-    #btn-retry:hover { background: #0a5fc0; }
+    #btn-retry:hover { background: var(--accent-hover); }
     .hidden { display: none !important; }
   </style>
 </head>

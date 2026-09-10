@@ -45,7 +45,7 @@
 |---|---|
 | Chat | 切换到官方 DeepSeek Chat 网页 |
 | Harness | 切换到 dsh Harness 界面(默认) |
-| 设置 | 自动关闭dsh和更新 |
+| 设置 | 主题(浅色 / 深色 / 跟随系统)、关闭dsh和更新 |
 
 ## 构建
 

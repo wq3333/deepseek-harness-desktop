@@ -10,11 +10,32 @@
       --fg: #1f2328;
       --muted: #57606a;
       --accent: #0969da;
+      --accent-hover: #0a5fc0;
       --border: #d0d7de;
       --hover: rgba(31, 35, 40, 0.07);
       --active-bg: rgba(9, 105, 218, 0.10);
       --active-border: rgba(9, 105, 218, 0.35);
       --danger: #cf222e;
+      --card: #ffffff;
+      --shadow: rgba(31, 35, 40, 0.20);
+    }
+    /* Dark palette, applied by the Rust side via data-dsh-theme on <html> */
+    html[data-dsh-theme="dark"] {
+      --bar: #161b22;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --border: #30363d;
+      --hover: rgba(230, 237, 243, 0.08);
+      --active-bg: rgba(88, 166, 255, 0.15);
+      --active-border: rgba(88, 166, 255, 0.40);
+      --danger: #f85149;
+      --card: #0d1117;
+      --shadow: rgba(0, 0, 0, 0.50);
+    }
+    html[data-dsh-theme="dark"] #settings-backdrop {
+      background: rgba(0, 0, 0, 0.50);
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; overflow: hidden; }
@@ -120,10 +141,10 @@
       max-height: calc(100vh - 120px);
       display: flex;
       flex-direction: column;
-      background: #fff;
+      background: var(--card);
       border: 1px solid var(--border);
       border-radius: 10px;
-      box-shadow: 0 12px 32px rgba(31, 35, 40, 0.20);
+      box-shadow: 0 12px 32px var(--shadow);
       z-index: 30;
       padding: 14px 20px 18px;
       overflow: hidden;
@@ -226,6 +247,30 @@
       cursor: pointer;
       flex: none;
     }
+    /* segmented control (theme selector) */
+    .seg {
+      display: flex;
+      flex: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .seg button {
+      appearance: none;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      padding: 4px 11px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .seg button:hover { background: var(--hover); color: var(--fg); }
+    .seg button.active {
+      background: var(--active-bg);
+      color: var(--accent);
+      font-weight: 600;
+    }
     .panel-title {
       font-size: 14px;
       font-weight: 600;
@@ -240,7 +285,7 @@
     .sm-action {
       appearance: none;
       border: 1px solid var(--border);
-      background: #fff;
+      background: var(--card);
       width: 100%;
       display: flex;
       align-items: center;
@@ -260,7 +305,7 @@
       border-color: var(--accent);
       color: #fff;
     }
-    .sm-action.primary:hover:not(:disabled) { background: #0a5fc0; }
+    .sm-action.primary:hover:not(:disabled) { background: var(--accent-hover); }
     .sm-action:disabled { opacity: 0.5; cursor: default; }
 
     /* ---- transient toast (top-right, shown by expanding the bar a bit) ---- */
@@ -269,10 +314,10 @@
       top: 52px;
       right: 12px;
       max-width: min(380px, calc(100vw - 24px));
-      background: #fff;
+      background: var(--card);
       border: 1px solid var(--border);
       border-radius: 8px;
-      box-shadow: 0 8px 24px rgba(31, 35, 40, 0.16);
+      box-shadow: 0 8px 24px var(--shadow);
       padding: 10px 14px;
       font-size: 13px;
       color: var(--fg);
@@ -326,7 +371,7 @@
     .about-actions button {
       appearance: none;
       border: 1px solid var(--border);
-      background: #fff;
+      background: var(--card);
       color: var(--fg);
       font-size: 13px;
       padding: 6px 14px;
@@ -339,7 +384,7 @@
       border-color: var(--accent);
       color: #fff;
     }
-    .about-actions button.primary:hover:not(:disabled) { background: #0a5fc0; }
+    .about-actions button.primary:hover:not(:disabled) { background: var(--accent-hover); }
     .about-actions button:disabled { opacity: 0.5; cursor: default; }
 
     /* repo link inside the about section */
@@ -442,6 +487,14 @@
             <span class="opt-label">自动更新</span>
             <input type="checkbox" id="opt-auto-update" />
           </label>
+          <div class="opt-row">
+            <span class="opt-label">主题</span>
+            <div class="seg" id="theme-seg">
+              <button type="button" data-theme="light">浅色</button>
+              <button type="button" data-theme="dark">深色</button>
+              <button type="button" data-theme="system" class="active">跟随系统</button>
+            </div>
+          </div>
         </div>
 
         <div class="sm-panel" data-panel="update">
@@ -582,6 +635,18 @@
         }
       }
 
+      // ---- theme selector ----
+      var currentTheme = "system";
+      function setThemeSeg(t) {
+        currentTheme = t || "system";
+        var seg = document.getElementById("theme-seg");
+        if (!seg) return;
+        var bs = seg.querySelectorAll("button");
+        for (var i = 0; i < bs.length; i++) {
+          bs[i].classList.toggle("active", bs[i].getAttribute("data-theme") === currentTheme);
+        }
+      }
+
       // Render one status line + progress bar (determinate or indeterminate)
       // for the given panel prefix ("dsh" or "about").
       function renderStatus(prefix, s, active) {
@@ -662,6 +727,7 @@
           if (!s) return;
           document.getElementById("opt-close-dsh").checked = !!s.closeStopsDsh;
           document.getElementById("opt-auto-update").checked = !!s.autoUpdate;
+          setThemeSeg(s.theme || "system");
         }).catch(function () {});
 
         // About section: app version + repo, and restore any in-flight/last
@@ -685,7 +751,8 @@
       function saveSettings() {
         var settings = {
           closeStopsDsh: document.getElementById("opt-close-dsh").checked,
-          autoUpdate: document.getElementById("opt-auto-update").checked
+          autoUpdate: document.getElementById("opt-auto-update").checked,
+          theme: currentTheme
         };
         invoke("save_settings", { settings: settings }).catch(function (e) {
           showToast("保存设置失败:" + e);
@@ -760,6 +827,16 @@
       // Settings toggles persist immediately.
       document.getElementById("opt-close-dsh").addEventListener("change", saveSettings);
       document.getElementById("opt-auto-update").addEventListener("change", saveSettings);
+      var themeSeg = document.getElementById("theme-seg");
+      if (themeSeg) {
+        var themeBtns = themeSeg.querySelectorAll("button");
+        for (var i = 0; i < themeBtns.length; i++) {
+          themeBtns[i].addEventListener("click", function () {
+            setThemeSeg(this.getAttribute("data-theme"));
+            saveSettings();
+          });
+        }
+      }
 
       document.getElementById("toast").addEventListener("click", function () {
         if (window.__toastTimer) clearTimeout(window.__toastTimer);
@@ -779,7 +856,7 @@
         invoke("quit");
       });
 
-      win.maximize();
+      //win.maximize();
     })();
   </script>
 </body>
