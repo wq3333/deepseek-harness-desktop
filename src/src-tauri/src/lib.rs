@@ -64,26 +64,42 @@ struct BarHeight(Mutex<f64>);
 /// the F12 shortcut to open DevTools on the page the user is actually viewing.
 struct CurrentTarget(Mutex<String>);
 
-/// Live update/check state shared with the title bar UI. Written by the
-/// check/update commands (possibly from background threads) and broadcast via
-/// the `update-progress` event; the About dialog also queries it through
-/// `get_update_state`, so closing and reopening the dialog keeps the status.
+/// Live per-target (dsh / desktop app) check & update state shared with the
+/// merged 关于 panel of the title bar. Written by the check/update commands
+/// (possibly from background threads) and broadcast via the `about-progress`
+/// event; the panel also queries it through `get_about_state`, so closing and
+/// reopening the popup keeps every status.
 #[derive(Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateState {
+struct TargetState {
     /// idle | checking | downloading | installing | restarting | finalizing | done | error
     phase: String,
     /// 0..=100 when the progress is measurable; None = indeterminate bar.
     progress: Option<f64>,
     message: String,
     error: Option<String>,
+    /// Installed / current version (dsh from npm, app from package info).
+    current: Option<String>,
+    /// Latest published version (dsh from the npm registry, app from GitHub).
     latest: Option<String>,
     update_available: bool,
+    /// Desktop-only: release notes of the newest GitHub release.
     release_notes: String,
+    /// Desktop-only: download URL of the newest portable exe.
+    asset_url: String,
 }
 
-/// Latest update/check state, readable at any time via `get_update_state`.
-struct SharedUpdateState(Mutex<UpdateState>);
+/// Latest check/update state for both targets, readable at any time via
+/// `get_about_state` and broadcast via `about-progress`.
+#[derive(Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AboutState {
+    dsh: TargetState,
+    app: TargetState,
+}
+
+/// Shared per-target check/update state.
+struct SharedAboutState(Mutex<AboutState>);
 
 /// One row of the startup environment checklist shown on the loading page
 /// (WebView2 / Node.js / dsh / dsh 服务).
@@ -226,11 +242,15 @@ fn theme_apply_js(theme: &str) -> String {
 }
 
 /// Static init-script form of the theme (no closure), baked into webviews so
-/// the very first paint of a page is already themed.
+/// the very first paint of a page is already themed. The root element does not
+/// exist yet when this runs (init scripts execute at document-start), so it
+/// waits for `document.documentElement` via animation frames — which still
+/// fire before the first paint — instead of throwing
+/// "Cannot read properties of null (reading 'style')".
 fn theme_init_script(theme: &str) -> String {
     let v = if theme == "dark" { "dark" } else { "light" };
     format!(
-        "document.documentElement.style.colorScheme='{v}';document.documentElement.setAttribute('data-dsh-theme','{v}');"
+        "(function(){{function t(){{var d=document.documentElement;if(!d){{requestAnimationFrame(t);return;}}d.style.colorScheme='{v}';d.setAttribute('data-dsh-theme','{v}');}}t();}})();"
     )
 }
 
@@ -496,25 +516,39 @@ fn setup_log(app: &tauri::AppHandle, line: impl Into<String>) {
     let _ = app.emit("setup-log", line.into());
 }
 
-/// True while a check/update is in flight (prevents starting another one).
-fn update_active(state: &UpdateState) -> bool {
+/// True while a check/update is in flight for one target (prevents starting
+/// another one on the same target).
+fn target_active(state: &TargetState) -> bool {
     matches!(
         state.phase.as_str(),
         "checking" | "downloading" | "installing" | "restarting" | "finalizing"
     )
 }
 
-/// Persist the update state and broadcast it to the title bar UI.
-fn publish_update_state(app: &tauri::AppHandle, state: UpdateState) {
-    *app.state::<SharedUpdateState>().0.lock().unwrap() = state.clone();
-    let _ = app.emit("update-progress", state);
+/// True while any check/update is in flight (guards the single 检查更新 button
+/// of the 关于 panel and the startup auto-update).
+fn about_active(app: &tauri::AppHandle) -> bool {
+    let st = app.state::<SharedAboutState>().0.lock().unwrap().clone();
+    target_active(&st.dsh) || target_active(&st.app)
 }
 
-/// Return the current update/check state (the About dialog restores it when
-/// reopened after being closed mid-update).
+/// Mutate one target of the shared AboutState ("dsh" | "app") and broadcast a
+/// snapshot of the whole state to the title bar UI via `about-progress`.
+fn update_target(app: &tauri::AppHandle, key: &str, f: impl FnOnce(&mut TargetState)) {
+    let state = app.state::<SharedAboutState>();
+    let mut st = state.0.lock().unwrap();
+    let target = if key == "dsh" { &mut st.dsh } else { &mut st.app };
+    f(target);
+    let snapshot = st.clone();
+    drop(st);
+    let _ = app.emit("about-progress", snapshot);
+}
+
+/// Return the current check/update state for both targets (the 关于 panel
+/// restores it when reopened after being closed mid-check/mid-update).
 #[tauri::command]
-fn get_update_state(app: tauri::AppHandle) -> UpdateState {
-    app.state::<SharedUpdateState>().0.lock().unwrap().clone()
+fn get_about_state(app: tauri::AppHandle) -> AboutState {
+    app.state::<SharedAboutState>().0.lock().unwrap().clone()
 }
 
 /// Spawn console-subsystem children (netstat, taskkill, npm, npx...) without
@@ -1286,8 +1320,11 @@ fn add_webviews(
 }
 
 /// Resize the title bar webview to a given height. `height <= 0` means the
-/// full window height (used by the "更多" dropdown); otherwise it is clamped
+/// full window height (used by the settings popup); otherwise it is clamped
 /// to `[TITLE_BAR_HEIGHT, window height]` (a small height is used for toasts).
+/// When the webview shrinks (popup/toast closing), it is hidden for the
+/// resize and re-shown at the final size, so the compositor never paints the
+/// shrinking transparent full-window surface (the source of the close hitch).
 #[tauri::command]
 fn set_bar_height(app: tauri::AppHandle, height: f64) {
     let Some(bar) = app.get_webview("bar") else {
@@ -1309,9 +1346,24 @@ fn set_bar_height(app: tauri::AppHandle, height: f64) {
     } else {
         height.clamp(TITLE_BAR_HEIGHT, max_h)
     };
-    *app.state::<BarHeight>().0.lock().unwrap() = h;
+    let bar_height_state = app.state::<BarHeight>();
+    let mut bar_height = bar_height_state.0.lock().unwrap();
+    let shrinking = h < *bar_height;
+    *bar_height = h;
+    drop(bar_height);
+    // Shrinking the transparent full-window webview back to the title strip
+    // makes WebView2 recomposite the whole surface, which can visibly hitch
+    // right after the settings popup fades out. Resize while hidden and show
+    // again at the final size in the same synchronous command, so the shrink
+    // is never painted.
+    if shrinking {
+        let _ = bar.hide();
+    }
     let _ = bar.set_position(tauri::LogicalPosition::new(0.0, 0.0));
     let _ = bar.set_size(tauri::LogicalSize::new(ls.width, h));
+    if shrinking {
+        let _ = bar.show();
+    }
 }
 
 /// Switch which content webview is visible (harness dsh GUI vs chat web).
@@ -1605,10 +1657,10 @@ fn download_with_progress(
     Ok(())
 }
 
-/// Check for a dsh update and apply it if one is available
-/// (更多 -> "更新 dsh"). All npm steps run hidden, in a background thread,
-/// and the result is reported both through the shared update state (progress
-/// bar in the About dialog) and with a toast.
+/// Apply a dsh update: install the latest `@deepseek-ai/dsh` from npm, restart
+/// the dsh service and navigate the harness view back to it
+/// (关于 -> dsh 卡片 -> "更新 dsh"). All npm steps run hidden, in a background
+/// thread, and progress is published to the dsh target of the 关于 panel.
 #[tauri::command]
 fn update_dsh(app: tauri::AppHandle) {
     if *app.state::<SetupRunning>().0.lock().unwrap() {
@@ -1616,43 +1668,36 @@ fn update_dsh(app: tauri::AppHandle) {
         return;
     }
     {
-        let state = app.state::<SharedUpdateState>().0.lock().unwrap().clone();
-        if update_active(&state) {
-            show_toast(&app, "已有更新正在进行");
+        let st = app.state::<SharedAboutState>().0.lock().unwrap().clone();
+        if target_active(&st.dsh) {
+            show_toast(&app, "dsh 更新正在进行");
             return;
         }
     }
-    publish_update_state(
-        &app,
-        UpdateState {
-            phase: "checking".into(),
-            message: "正在检查 dsh 版本…".into(),
-            ..Default::default()
-        },
-    );
+    update_target(&app, "dsh", |t| {
+        t.phase = "checking".into();
+        t.message = "正在准备更新 dsh…".into();
+        t.progress = None;
+        t.error = None;
+    });
     let port = active_port();
     std::thread::spawn(move || match update_dsh_inner(&app, port) {
         Ok(msg) => {
-            publish_update_state(
-                &app,
-                UpdateState {
-                    phase: "done".into(),
-                    message: msg.clone(),
-                    ..Default::default()
-                },
-            );
+            update_target(&app, "dsh", |t| {
+                t.phase = "done".into();
+                t.message = msg.clone();
+                t.current = t.latest.clone();
+                t.update_available = false;
+                t.error = None;
+            });
             show_toast(&app, msg);
         }
         Err(e) => {
-            publish_update_state(
-                &app,
-                UpdateState {
-                    phase: "error".into(),
-                    error: Some(e.clone()),
-                    message: format!("dsh 更新失败:{e}"),
-                    ..Default::default()
-                },
-            );
+            update_target(&app, "dsh", |t| {
+                t.phase = "error".into();
+                t.error = Some(e.clone());
+                t.message = format!("dsh 更新失败:{e}");
+            });
             show_toast(&app, format!("dsh 更新失败:{e}"));
         }
     });
@@ -1681,16 +1726,13 @@ fn update_dsh_inner(app: &tauri::AppHandle, port: u16) -> Result<String, String>
     }
 
     // Update available: stop, install (hidden), start, navigate.
-    publish_update_state(
-        app,
-        UpdateState {
-            phase: "installing".into(),
-            progress: None,
-            message: format!("正在安装 dsh v{latest}…"),
-            latest: Some(latest.clone()),
-            ..Default::default()
-        },
-    );
+    update_target(app, "dsh", |t| {
+        t.phase = "installing".into();
+        t.progress = None;
+        t.message = format!("正在安装 dsh v{latest}…");
+        t.latest = Some(latest.clone());
+        t.error = None;
+    });
     stop_dsh(app, port);
     run_capture(
         "cmd",
@@ -1698,15 +1740,11 @@ fn update_dsh_inner(app: &tauri::AppHandle, port: u16) -> Result<String, String>
     )
     .map_err(|e| format!("安装失败:{e}"))?;
 
-    publish_update_state(
-        app,
-        UpdateState {
-            phase: "restarting".into(),
-            message: "正在重启 dsh 服务…".into(),
-            latest: Some(latest.clone()),
-            ..Default::default()
-        },
-    );
+    update_target(app, "dsh", |t| {
+        t.phase = "restarting".into();
+        t.message = "正在重启 dsh 服务…".into();
+        t.latest = Some(latest.clone());
+    });
     match spawn_server(port) {
         Ok(child) => {
             *app.state::<ServerState>().0.lock().unwrap() = Some(child);
@@ -2108,7 +2146,7 @@ fn setup_and_start_inner(app: &tauri::AppHandle, port: u16) -> Result<(), String
 /// (loading page "重试" button).
 #[tauri::command]
 fn retry_setup(app: tauri::AppHandle) {
-    if update_active(&app.state::<SharedUpdateState>().0.lock().unwrap().clone()) {
+    if about_active(&app) {
         show_toast(&app, "更新正在进行中，请稍后再试");
         return;
     }
@@ -2134,16 +2172,6 @@ fn get_setup_state(app: tauri::AppHandle) -> SetupState {
 struct LatestRelease {
     tag_name: String,
     body: Option<String>,
-    asset_url: String,
-}
-
-/// Result of a manual update check, serialized back to the title bar UI.
-#[derive(serde::Serialize)]
-struct UpdateInfo {
-    current: String,
-    latest: String,
-    update_available: bool,
-    release_notes: String,
     asset_url: String,
 }
 
@@ -2213,12 +2241,19 @@ fn parse_semver(s: &str) -> Option<semver::Version> {
     semver::Version::parse(s.trim().trim_start_matches('v')).ok()
 }
 
-/// Desktop app info shown in the 关于 dialog: version + repo. `repo` comes
-/// from the GITHUB_REPO constant so the UI never drifts from the backend.
+/// Desktop app info shown in the 关于 panel: version + repo + installed dsh
+/// version. `repo` comes from the GITHUB_REPO constant so the UI never drifts
+/// from the backend; `dsh_version` is None when dsh is not installed.
+///
+/// `rename_all = "camelCase"` is required here: the title bar reads
+/// `info.dshVersion`, and without it serde would serialize the field as
+/// `dsh_version`, which the JS reads as undefined and renders as "未安装".
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AppInfo {
     version: String,
     repo: String,
+    dsh_version: Option<String>,
 }
 
 #[tauri::command]
@@ -2226,6 +2261,135 @@ fn get_app_info(app: tauri::AppHandle) -> AppInfo {
     AppInfo {
         version: app.package_info().version.to_string(),
         repo: GITHUB_REPO.to_string(),
+        dsh_version: dsh_version(),
+    }
+}
+
+/// A dsh update is due when dsh is not installed yet, or the npm latest is
+/// strictly newer than the installed version. A failed npm query (empty
+/// `latest`) never counts as an update.
+fn dsh_should_update(current: Option<&str>, latest: &str) -> bool {
+    match (current, parse_semver(latest)) {
+        (None, Some(_)) => true,
+        (Some(c), Some(l)) => parse_semver(c).map_or(true, |c| l > c),
+        _ => false,
+    }
+}
+
+/// A desktop-app update is due when the latest GitHub release version differs
+/// from the running version (same rule as the pre-existing 关于 check).
+fn app_should_update(current: &str, latest_raw: &str) -> bool {
+    matches!(
+        (parse_semver(latest_raw), parse_semver(current)),
+        (Some(l), Some(c)) if l != c
+    )
+}
+
+/// Check the dsh target (installed vs npm latest) and publish the result to
+/// the dsh row of the 关于 panel. Runs on its own thread inside `check_updates`.
+fn check_dsh_target(app: &tauri::AppHandle) {
+    update_target(app, "dsh", |t| {
+        t.phase = "checking".into();
+        t.message = "正在检查 dsh 更新…".into();
+        t.progress = None;
+        t.error = None;
+    });
+    let current = dsh_version();
+    let latest = npm_latest_dsh();
+    if latest.is_empty() {
+        update_target(app, "dsh", |t| {
+            t.phase = "error".into();
+            t.error = Some("无法获取最新版本".into());
+            t.message = "检查 dsh 更新失败:无法获取最新版本".into();
+        });
+        return;
+    }
+    let update_available = dsh_should_update(current.as_deref(), &latest);
+    let message = if update_available {
+        match &current {
+            Some(c) => format!("发现新版本 v{c} → v{latest}"),
+            None => format!("发现新版本 v{latest}（尚未安装 dsh）"),
+        }
+    } else {
+        format!("已是最新版本 v{}", current.as_deref().unwrap_or("?"))
+    };
+    update_target(app, "dsh", |t| {
+        t.phase = "done".into();
+        t.current = current;
+        t.latest = Some(latest);
+        t.update_available = update_available;
+        t.message = message;
+        t.error = None;
+    });
+}
+
+/// Check the desktop-app target (running version vs latest GitHub release) and
+/// publish the result to the app row of the 关于 panel. Runs on its own thread
+/// inside `check_updates`.
+fn check_app_target(app: &tauri::AppHandle) {
+    update_target(app, "app", |t| {
+        t.phase = "checking".into();
+        t.message = "正在检查桌面版更新…".into();
+        t.progress = None;
+        t.error = None;
+    });
+    let current = app.package_info().version.to_string();
+    match fetch_latest_release() {
+        Ok(release) => {
+            let latest_raw = release.tag_name.trim().trim_start_matches('v').to_string();
+            let update_available = app_should_update(&current, &latest_raw);
+            let message = if update_available {
+                format!("发现新版本 v{latest_raw}")
+            } else {
+                format!("已是最新版本 v{current}")
+            };
+            update_target(app, "app", |t| {
+                t.phase = "done".into();
+                t.current = Some(current);
+                t.latest = Some(latest_raw);
+                t.update_available = update_available;
+                t.release_notes = release.body.unwrap_or_default();
+                t.asset_url = release.asset_url;
+                t.message = message;
+                t.error = None;
+            });
+        }
+        Err(e) => update_target(app, "app", |t| {
+            t.phase = "error".into();
+            t.error = Some(e.clone());
+            t.message = format!("检查桌面版更新失败:{e}");
+        }),
+    }
+}
+
+/// The 关于 panel's per-target 检查更新 buttons: each card (dsh / 桌面版) checks
+/// only its own target, so the two checks run independently (and can overlap).
+/// Progress is broadcast via the `about-progress` event. An unknown target is a
+/// no-op, and each target is guarded individually by its own in-flight phase.
+#[tauri::command]
+fn check_updates(app: tauri::AppHandle, target: String) {
+    match target.as_str() {
+        "dsh" => {
+            {
+                let st = app.state::<SharedAboutState>().0.lock().unwrap().clone();
+                if target_active(&st.dsh) {
+                    show_toast(&app, "dsh 检查/更新正在进行");
+                    return;
+                }
+            }
+            std::thread::spawn(move || check_dsh_target(&app));
+        }
+        "app" => {
+            {
+                let st = app.state::<SharedAboutState>().0.lock().unwrap().clone();
+                if target_active(&st.app) {
+                    show_toast(&app, "桌面版检查/更新正在进行");
+                    return;
+                }
+            }
+            std::thread::spawn(move || check_app_target(&app));
+        }
+        _ => {}
     }
 }
 
@@ -2277,112 +2441,56 @@ fn is_internal_url(url: &url::Url, port: u16) -> bool {
     }
 }
 
-/// Compare the running desktop version against the latest GitHub release.
-/// Never throws for "no releases yet" (treated as up to date); network / API
-/// errors come back as a Chinese error string. Progress is published through
-/// the shared UpdateState so the dialog keeps its status across close/reopen.
-#[tauri::command]
-async fn check_update(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
-    let current = app.package_info().version.to_string();
-    publish_update_state(
-        &app,
-        UpdateState {
-            phase: "checking".into(),
-            message: "正在检查更新…".into(),
-            ..Default::default()
-        },
-    );
-    let result = fetch_latest_release().map(|release| {
-        let latest_raw = release.tag_name.trim().trim_start_matches('v').to_string();
-        let update_available = matches!(
-            (parse_semver(&latest_raw), parse_semver(&current)),
-            (Some(l), Some(c)) if l != c
-        );
-        UpdateInfo {
-            current,
-            latest: latest_raw,
-            update_available,
-            release_notes: release.body.unwrap_or_default(),
-            asset_url: release.asset_url,
-        }
-    });
-    match result {
-        Ok(info) => {
-            publish_update_state(
-                &app,
-                UpdateState {
-                    phase: "idle".into(),
-                    message: if info.update_available {
-                        format!("发现新版本 v{}", info.latest)
-                    } else {
-                        format!("已是最新版本(v{})", info.current)
-                    },
-                    latest: Some(info.latest.clone()),
-                    update_available: info.update_available,
-                    release_notes: info.release_notes.clone(),
-                    ..Default::default()
-                },
-            );
-            Ok(info)
-        }
-        Err(e) => {
-            publish_update_state(
-                &app,
-                UpdateState {
-                    phase: "error".into(),
-                    error: Some(e.clone()),
-                    message: format!("检查更新失败:{e}"),
-                    ..Default::default()
-                },
-            );
-            Err(e)
-        }
-    }
-}
-
-/// Portable-exe self update: download the new exe from the latest GitHub
-/// release (hidden PowerShell, polled for real byte progress), then hand over
-/// to a detached helper that waits for this process to exit, replaces the
-/// running exe and relaunches it. Runs on a background thread so the About
-/// dialog can be closed and reopened without losing the update status.
+/// Portable-exe self update of the desktop app
+/// (关于 -> 桌面版卡片 -> "更新桌面版"). Downloads the new exe from the latest
+/// GitHub release (hidden PowerShell, polled for real byte progress), then
+/// hands over to a detached helper that waits for this process to exit,
+/// replaces the running exe and relaunches it. Runs on a background thread so
+/// the 关于 panel can be closed and reopened without losing the update status.
 #[tauri::command]
 fn update_app(app: tauri::AppHandle) -> Result<(), String> {
     {
-        let state = app.state::<SharedUpdateState>().0.lock().unwrap().clone();
-        if update_active(&state) {
-            return Err("已有更新正在进行".into());
+        let st = app.state::<SharedAboutState>().0.lock().unwrap().clone();
+        if target_active(&st.app) {
+            return Err("桌面版更新正在进行".into());
         }
     }
     std::thread::spawn(move || {
         if let Err(e) = update_app_inner(&app) {
-            publish_update_state(
-                &app,
-                UpdateState {
-                    phase: "error".into(),
-                    error: Some(e.clone()),
-                    message: format!("更新失败:{e}"),
-                    ..Default::default()
-                },
-            );
+            update_target(&app, "app", |t| {
+                t.phase = "error".into();
+                t.error = Some(e.clone());
+                t.message = format!("更新桌面版失败:{e}");
+            });
         }
     });
     Ok(())
 }
 
 fn update_app_inner(app: &tauri::AppHandle) -> Result<(), String> {
-    publish_update_state(
-        app,
-        UpdateState {
-            phase: "checking".into(),
-            message: "正在获取版本信息…".into(),
-            ..Default::default()
-        },
-    );
+    update_target(app, "app", |t| {
+        t.phase = "checking".into();
+        t.message = "正在获取版本信息…".into();
+        t.progress = None;
+        t.error = None;
+    });
     let release = fetch_latest_release()?;
     if release.asset_url.is_empty() {
         return Err("该发布中没有可用的 exe 更新包".into());
     }
+    let tmp_exe = download_app_update(app, &release)?;
+    finalize_app_update(app, &tmp_exe)
+}
 
+/// Download phase of the portable-exe self update: fetch the new exe from the
+/// latest GitHub release to a temp location (hidden PowerShell, polled for real
+/// byte progress) and return its path. Unlike `update_app_inner` it does NOT
+/// exit the process, so the startup auto-update can keep the app alive until a
+/// concurrently running dsh update has settled.
+fn download_app_update(
+    app: &tauri::AppHandle,
+    release: &LatestRelease,
+) -> Result<std::path::PathBuf, String> {
     let current_exe = std::env::current_exe().map_err(|e| format!("无法定位当前程序路径:{e}"))?;
     let exe_name = current_exe
         .file_name()
@@ -2416,15 +2524,11 @@ fn update_app_inner(app: &tauri::AppHandle) -> Result<(), String> {
     std::fs::write(&ps_file, &ps).map_err(|e| format!("写入下载脚本失败:{e}"))?;
     let mut child = spawn_ps_hidden(&ps_file, &log).map_err(|e| format!("启动下载失败:{e}"))?;
 
-    publish_update_state(
-        app,
-        UpdateState {
-            phase: "downloading".into(),
-            progress: Some(0.0),
-            message: "正在下载更新包…".into(),
-            ..Default::default()
-        },
-    );
+    update_target(app, "app", |t| {
+        t.phase = "downloading".into();
+        t.progress = Some(0.0);
+        t.message = "正在下载更新包…".into();
+    });
 
     // Poll the partial file size to drive the progress bar; throttle updates
     // to whole-percent changes so the event stream stays light.
@@ -2451,15 +2555,11 @@ fn update_app_inner(app: &tauri::AppHandle) -> Result<(), String> {
                         let pct = (len as f64 / total as f64 * 100.0).min(100.0);
                         if (pct - last_pct).abs() >= 1.0 {
                             last_pct = pct;
-                            publish_update_state(
-                                app,
-                                UpdateState {
-                                    phase: "downloading".into(),
-                                    progress: Some(pct),
-                                    message: format!("正在下载更新包… {pct:.0}%"),
-                                    ..Default::default()
-                                },
-                            );
+                            update_target(app, "app", |t| {
+                                t.phase = "downloading".into();
+                                t.progress = Some(pct);
+                                t.message = format!("正在下载更新包… {pct:.0}%");
+                            });
                         }
                     }
                 }
@@ -2476,20 +2576,30 @@ fn update_app_inner(app: &tauri::AppHandle) -> Result<(), String> {
     if len == 0 {
         return Err("下载结果为空，更新失败".into());
     }
+    Ok(tmp_exe)
+}
 
-    publish_update_state(
-        app,
-        UpdateState {
-            phase: "finalizing".into(),
-            progress: Some(100.0),
-            message: "正在替换程序并重启…".into(),
-            ..Default::default()
-        },
-    );
+/// Finalize phase of the portable-exe self update: write a detached helper that
+/// waits for this process to exit, swaps the running exe and relaunches it,
+/// then quit the app (the helper's process tree survives the exit). Used by
+/// both the manual 关于 "更新桌面版" button and the startup auto-update.
+fn finalize_app_update(app: &tauri::AppHandle, tmp_exe: &std::path::Path) -> Result<(), String> {
+    let current_exe = std::env::current_exe().map_err(|e| format!("无法定位当前程序路径:{e}"))?;
+    let exe_name = current_exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("deepseek-harness.exe");
+
+    update_target(app, "app", |t| {
+        t.phase = "finalizing".into();
+        t.progress = Some(100.0);
+        t.message = "正在替换程序并重启…".into();
+    });
 
     // Write a detached helper that waits for us to exit, swaps the exe and
     // relaunches it. It keeps running after the parent (this app) exits, so it
     // can overwrite the file our own process no longer locks.
+    let tmp_dir = std::env::temp_dir();
     let log = tmp_dir.join(format!("{exe_name}.update-helper.log"));
     let helper = tmp_dir.join(format!("{exe_name}.update-helper.bat"));
     let bat = format!(
@@ -2524,7 +2634,7 @@ fn update_app_inner(app: &tauri::AppHandle) -> Result<(), String> {
     {
         let _ = Command::new("sh").arg(&helper).spawn();
     }
-    flush_window_state(&app);
+    flush_window_state(app);
     app.exit(0);
     Ok(())
 }
@@ -2539,10 +2649,14 @@ fn npm_latest_dsh() -> String {
         .to_string()
 }
 
-/// Startup auto-update (自动更新 setting): in a background thread, update dsh
-/// to the latest npm version and, when a strictly-newer desktop release
-/// exists, download + replace + relaunch the app. Stays silent when everything
-/// is current; only real updates (or dsh failures) surface a toast.
+/// Startup auto-update (自动更新 setting): check + update dsh (npm) and the
+/// desktop app (GitHub release) in parallel background threads, so neither
+/// target is ever skipped by the other. The desktop-app self update normally
+/// ends by exiting the process (the detached helper swaps the exe), so its
+/// final exit waits for the dsh flow to settle first — otherwise the process
+/// exit would cut a concurrent dsh npm install / server restart short. Stays
+/// silent when everything is current; only real updates (or dsh failures)
+/// surface a toast.
 fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
     if !load_settings(&app).auto_update {
         return;
@@ -2550,66 +2664,93 @@ fn maybe_auto_update(app: tauri::AppHandle, port: u16) {
     if *app.state::<SetupRunning>().0.lock().unwrap() {
         return;
     }
-    {
-        let state = app.state::<SharedUpdateState>().0.lock().unwrap().clone();
-        if update_active(&state) {
-            return;
-        }
+    if about_active(&app) {
+        return;
     }
+
+    // Set once the dsh check/update flow has fully finished. The desktop-app
+    // thread waits on it before exiting the process, so the self-update
+    // restart never interrupts a dsh update that is still in flight.
+    let dsh_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Thread A: dsh (npm) — update when not installed yet or when a newer
+    // version exists. Runs fully independently of the desktop-app update.
+    {
+        let app = app.clone();
+        let done = dsh_done.clone();
+        std::thread::spawn(move || {
+            let current = dsh_version();
+            let latest = npm_latest_dsh();
+            if dsh_should_update(current.as_deref(), &latest) {
+                match update_dsh_inner(&app, port) {
+                    Ok(msg) => {
+                        update_target(&app, "dsh", |t| {
+                            t.phase = "done".into();
+                            t.message = msg.clone();
+                            t.current = t.latest.clone();
+                            t.update_available = false;
+                            t.error = None;
+                        });
+                        show_toast(&app, msg);
+                    }
+                    Err(e) => {
+                        update_target(&app, "dsh", |t| {
+                            t.phase = "error".into();
+                            t.error = Some(e.clone());
+                            t.message = format!("自动更新 dsh 失败:{e}");
+                        });
+                        show_toast(&app, format!("自动更新 dsh 失败:{e}"));
+                    }
+                }
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    // Thread B: desktop app (GitHub release) — update only when strictly newer.
     std::thread::spawn(move || {
-        // 1) desktop app (GitHub release): update only when strictly newer.
         match fetch_latest_release() {
             Ok(release) => {
                 let current = app.package_info().version.to_string();
                 let latest_raw = release.tag_name.trim().trim_start_matches('v').to_string();
-                let newer = matches!(
-                    (parse_semver(&latest_raw), parse_semver(&current)),
-                    (Some(l), Some(c)) if l != c
-                );
-                if newer {
+                if app_should_update(&current, &latest_raw) {
                     show_toast(&app, "发现新版本，正在后台更新应用…");
-                    if let Err(e) = update_app_inner(&app) {
-                        publish_update_state(
-                            &app,
-                            UpdateState {
-                                phase: "error".into(),
-                                error: Some(e.clone()),
-                                message: format!("自动更新应用失败:{e}"),
-                                ..Default::default()
-                            },
-                        );
+                    // Download first (this process must stay alive while the
+                    // concurrent dsh update runs), then wait for dsh to settle
+                    // before the final exit that swaps the exe.
+                    let tmp_exe = match download_app_update(&app, &release) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            update_target(&app, "app", |t| {
+                                t.phase = "error".into();
+                                t.error = Some(e.clone());
+                                t.message = format!("自动更新应用失败:{e}");
+                            });
+                            show_toast(&app, format!("自动更新应用失败:{e}"));
+                            return;
+                        }
+                    };
+                    // Bound the wait so a hung dsh flow can never block the
+                    // app restart forever; an interrupted dsh update is
+                    // retried on the next launch.
+                    let wait_deadline = std::time::Instant::now() + Duration::from_secs(600);
+                    while !dsh_done.load(std::sync::atomic::Ordering::SeqCst)
+                        && std::time::Instant::now() < wait_deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    if let Err(e) = finalize_app_update(&app, &tmp_exe) {
+                        update_target(&app, "app", |t| {
+                            t.phase = "error".into();
+                            t.error = Some(e.clone());
+                            t.message = format!("自动更新应用失败:{e}");
+                        });
                         show_toast(&app, format!("自动更新应用失败:{e}"));
                     }
+                    // finalize_app_update ends with app.exit(0) on success.
                 }
             }
             Err(_) => {} // 启动时网络失败保持安静
-        }
-
-        // 2) dsh (npm): update when not installed yet or when a newer version exists.
-        let current = dsh_version();
-        let latest = npm_latest_dsh();
-        let should_update_dsh = match (current.as_deref(), parse_semver(&latest)) {
-            (None, Some(_)) => true,
-            (Some(c), Some(l)) => parse_semver(c).map_or(true, |c| l > c),
-            _ => false,
-        };
-        if should_update_dsh {
-            match update_dsh_inner(&app, port) {
-                Ok(msg) => {
-                    publish_update_state(
-                        &app,
-                        UpdateState {
-                            phase: "done".into(),
-                            message: msg.clone(),
-                            ..Default::default()
-                        },
-                    );
-                    show_toast(&app, msg);
-                }
-                Err(e) => {
-                    show_toast(&app, format!("自动更新 dsh 失败:{e}"));
-                }
-            }
         }
     });
 }
@@ -2670,7 +2811,7 @@ pub fn run() {
         .manage(ServerState(Mutex::new(None)))
         .manage(BarHeight(Mutex::new(TITLE_BAR_HEIGHT)))
         .manage(CurrentTarget(Mutex::new("harness".to_string())))
-        .manage(SharedUpdateState(Mutex::new(UpdateState::default())))
+        .manage(SharedAboutState(Mutex::new(AboutState::default())))
         .manage(SetupRunning(Mutex::new(false)))
         .manage(SharedSetupState(Mutex::new(default_setup_state())))
         .manage(WindowStateStore(Mutex::new(WindowStateCache {
@@ -2685,11 +2826,11 @@ pub fn run() {
             quit_with_dsh,
             restart_dsh,
             update_dsh,
-            get_app_info,
-            open_url,
-            get_update_state,
-            check_update,
             update_app,
+            check_updates,
+            get_app_info,
+            get_about_state,
+            open_url,
             retry_setup,
             get_setup_state,
             get_settings,
@@ -2767,6 +2908,48 @@ mod tests {
     fn parse_npm_version_absent() {
         assert_eq!(parse_npm_version(""), None);
         assert_eq!(parse_npm_version("`-- some-other-pkg@1.0.0\n"), None);
+    }
+
+    #[test]
+    fn dsh_should_update_logic() {
+        // Not installed + a valid latest -> update is due.
+        assert!(dsh_should_update(None, "1.2.3"));
+        // Same version -> no update.
+        assert!(!dsh_should_update(Some("1.2.3"), "1.2.3"));
+        // Newer npm version -> update.
+        assert!(dsh_should_update(Some("1.2.3"), "1.3.0"));
+        // Pre-release installed vs stable latest -> update.
+        assert!(dsh_should_update(Some("0.1.0-rc.7"), "0.1.0"));
+        // Installed newer than the registry (downgrade) -> no update.
+        assert!(!dsh_should_update(Some("2.0.0"), "1.5.0"));
+        // Failed npm query (empty latest) -> never counts as an update.
+        assert!(!dsh_should_update(None, ""));
+        assert!(!dsh_should_update(Some("1.0.0"), "not-a-version"));
+    }
+
+    #[test]
+    fn app_should_update_logic() {
+        assert!(app_should_update("1.0.4", "1.1.0"));
+        assert!(!app_should_update("1.0.4", "1.0.4"));
+        // Any difference counts (same rule as the pre-existing 关于 check).
+        assert!(app_should_update("1.0.4", "1.0.3"));
+    }
+
+    #[test]
+    fn app_info_serializes_camel_case_fields() {
+        // Regression: the title bar reads info.dshVersion; without
+        // rename_all = "camelCase" the field serializes as dsh_version and the
+        // JS renders "未安装" even when dsh is installed.
+        let info = AppInfo {
+            version: "1.0.4".into(),
+            repo: "wq3333/deepseek-harness-desktop".into(),
+            dsh_version: Some("0.1.5-rc.1".into()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["dshVersion"], "0.1.5-rc.1");
+        assert!(json.get("dsh_version").is_none());
+        assert_eq!(json["version"], "1.0.4");
+        assert_eq!(json["repo"], "wq3333/deepseek-harness-desktop");
     }
 
     #[test]
@@ -2902,7 +3085,10 @@ mod tests {
     #[test]
     fn theme_init_script_bakes_resolved_theme() {
         let init = theme_init_script("dark");
-        assert!(init.starts_with("document.documentElement.style.colorScheme='dark';"));
+        // Waits for the root element (document-start) instead of touching
+        // document.documentElement.style while it is still null.
+        assert!(init.contains("requestAnimationFrame"));
+        assert!(init.contains("colorScheme='dark'"));
         assert!(init.contains("data-dsh-theme','dark'"));
     }
 

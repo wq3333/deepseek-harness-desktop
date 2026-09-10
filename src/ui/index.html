@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="zh-CN">
+
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -16,9 +17,10 @@
       --active-bg: rgba(9, 105, 218, 0.10);
       --active-border: rgba(9, 105, 218, 0.35);
       --danger: #cf222e;
+      --ok: #1a7f37;
       --card: #ffffff;
-      --shadow: rgba(31, 35, 40, 0.20);
     }
+
     /* Dark palette, applied by the Rust side via data-dsh-theme on <html> */
     html[data-dsh-theme="dark"] {
       --bar: #161b22;
@@ -31,18 +33,30 @@
       --active-bg: rgba(88, 166, 255, 0.15);
       --active-border: rgba(88, 166, 255, 0.40);
       --danger: #f85149;
+      --ok: #3fb950;
       --card: #0d1117;
-      --shadow: rgba(0, 0, 0, 0.50);
     }
+
     html[data-dsh-theme="dark"] #settings-backdrop {
-      background: rgba(0, 0, 0, 0.50);
+      background: rgba(0, 0, 0, 0.60);
     }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; overflow: hidden; }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+
     /* Transparent page background: the bar webview is stretched over the
        content area while the settings popup is open, so the page must let
        the content show through (the 44px #bar strip below stays opaque). */
-    html, body {
+    html,
+    body {
       background: transparent;
       color: var(--fg);
       font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
@@ -56,11 +70,10 @@
       display: flex;
       align-items: center;
       height: 44px;
-      padding: 0 0 0 14px;
       border-bottom: 1px solid var(--border);
       background: var(--bar);
     }
-    /* centered nav group: Chat, Harness, More(⋮) */
+
     .nav {
       position: absolute;
       left: 50%;
@@ -70,6 +83,7 @@
       gap: 6px;
       white-space: nowrap;
     }
+
     .nav button {
       appearance: none;
       border: 1px solid transparent;
@@ -81,14 +95,20 @@
       cursor: pointer;
       white-space: nowrap;
     }
-    .nav button:hover { background: var(--hover); color: var(--fg); }
+
+    .nav button:hover {
+      background: var(--hover);
+      color: var(--fg);
+    }
+
     .nav button.active {
       background: var(--active-bg);
       border-color: var(--active-border);
       color: var(--accent);
       font-weight: 600;
     }
-    #btn-more {
+
+    #btn-settings {
       width: 28px;
       height: 28px;
       padding: 0;
@@ -97,12 +117,18 @@
       justify-content: center;
     }
 
+    /* the settings gear mark (entry button + popup header share one family) */
+    .gear {
+      display: block;
+    }
+
     /* ---- window controls: uniform 46x44, flush to the right edge ---- */
     .win-controls {
       margin-left: auto;
       display: flex;
       height: 44px;
     }
+
     .win-controls button {
       appearance: none;
       border: 0;
@@ -115,8 +141,16 @@
       align-items: center;
       justify-content: center;
     }
-    .win-controls button:hover { background: var(--hover); color: var(--fg); }
-    .win-controls button.close:hover { background: #e81123; color: #fff; }
+
+    .win-controls button:hover {
+      background: var(--hover);
+      color: var(--fg);
+    }
+
+    .win-controls button.close:hover {
+      background: #e81123;
+      color: #fff;
+    }
 
     /* ---- settings popup (bar webview expands over content while open) ---- */
     #settings-backdrop {
@@ -125,44 +159,57 @@
       left: 0;
       right: 0;
       bottom: 0;
-      background: rgba(31, 35, 40, 0.28);
+      background: rgba(31, 35, 40, 0.1);
       z-index: 25;
       /* Fade in only after the bar webview has grown; see openSettings() */
       opacity: 0;
-      transition: opacity 0.16s ease;
+      /* No opacity transition: the dim layer is nearly invisible (alpha 0.1)
+         and animating a full-viewport layer frame-by-frame inside the
+         transparent bar webview is exactly what made closing the popup
+         stutter. It snaps; only the modal fades. */
     }
-    #settings-backdrop.visible { opacity: 1; }
+
+    #settings-backdrop.visible {
+      opacity: 1;
+    }
+
     #settings-modal {
       position: fixed;
       top: 50%;
       left: 50%;
-      transform: translate(-50%, -46%) scale(0.97);
-      width: min(540px, calc(100vw - 48px));
-      max-height: calc(100vh - 120px);
+      transform: translate(-50%, calc(-50% + 8px)) scale(0.97);
+      width: min(560px, calc(100vw - 48px));
+      height: min(350px, calc(100vh - 120px));
       display: flex;
       flex-direction: column;
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      box-shadow: 0 12px 32px var(--shadow);
+      border-radius: 12px;
+      box-shadow: 0 12px 32px var(--muted);
       z-index: 30;
-      padding: 14px 20px 18px;
+      padding: 16px 22px 18px;
       overflow: hidden;
       opacity: 0;
-      transition: opacity 0.18s ease, transform 0.18s ease;
+      transition: opacity 0.12s ease, transform 0.12s ease;
     }
+
     #settings-modal.visible {
       opacity: 1;
       transform: translate(-50%, -50%) scale(1);
     }
+
     /* `display: flex` above would otherwise defeat the hidden attribute */
-    #settings-modal[hidden] { display: none; }
+    #settings-modal[hidden] {
+      display: none;
+    }
+
     .sm-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 6px;
+      margin-bottom: 10px;
     }
+
     .sm-head h2 {
       margin: 0;
       font-size: 17px;
@@ -170,7 +217,12 @@
       align-items: center;
       gap: 8px;
     }
-    .sm-head h2 svg { color: var(--accent); flex: none; }
+
+    .sm-head h2 svg {
+      color: var(--accent);
+      flex: none;
+    }
+
     #settings-close {
       appearance: none;
       border: 0;
@@ -185,24 +237,31 @@
       align-items: center;
       justify-content: center;
     }
-    #settings-close:hover { background: var(--hover); color: var(--fg); }
+
+    #settings-close:hover {
+      background: var(--hover);
+      color: var(--fg);
+    }
+
     /* two-pane layout: left tabs / right content */
     .sm-body {
       flex: 1 1 auto;
-      min-height: 150px;
+      min-height: 0;
       display: flex;
-      gap: 14px;
+      gap: 16px;
     }
+
     .sm-tabs {
       flex: none;
-      width: 118px;
+      width: 120px;
       display: flex;
       flex-direction: column;
-      gap: 2px;
-      padding-right: 12px;
+      gap: 4px;
+      padding-right: 14px;
       border-right: 1px solid var(--border);
       overflow-y: auto;
     }
+
     .sm-tab {
       appearance: none;
       border: 0;
@@ -215,31 +274,49 @@
       cursor: pointer;
       white-space: nowrap;
     }
-    .sm-tab:hover { background: var(--hover); color: var(--fg); }
+
+    .sm-tab:hover {
+      background: var(--hover);
+      color: var(--fg);
+    }
+
     .sm-tab.active {
       background: var(--active-bg);
       color: var(--accent);
       font-weight: 600;
     }
+
     .sm-panels {
       flex: 1 1 auto;
       min-width: 0;
       overflow-y: auto;
+      padding-right: 2px;
     }
-    .sm-panel { display: none; }
-    .sm-panel.active { display: block; }
+
+    .sm-panel {
+      display: none;
+    }
+
+    .sm-panel.active {
+      display: block;
+    }
+
     .opt-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 8px 2px;
+      padding: 8px;
       border-radius: 6px;
       cursor: pointer;
       font-size: 13px;
       color: var(--fg);
     }
-    .opt-row:hover { background: var(--hover); }
+
+    .opt-row:hover {
+      background: var(--hover);
+    }
+
     .opt-row input[type="checkbox"] {
       width: 15px;
       height: 15px;
@@ -247,6 +324,7 @@
       cursor: pointer;
       flex: none;
     }
+
     /* segmented control (theme selector) */
     .seg {
       display: flex;
@@ -255,6 +333,7 @@
       border-radius: 6px;
       overflow: hidden;
     }
+
     .seg button {
       appearance: none;
       border: 0;
@@ -265,48 +344,23 @@
       cursor: pointer;
       white-space: nowrap;
     }
-    .seg button:hover { background: var(--hover); color: var(--fg); }
+
+    .seg button:hover {
+      background: var(--hover);
+      color: var(--fg);
+    }
+
     .seg button.active {
       background: var(--active-bg);
       color: var(--accent);
       font-weight: 600;
     }
+
     .panel-title {
       font-size: 14px;
       font-weight: 600;
       margin: 2px 0 10px;
     }
-    .panel-hint {
-      font-size: 12px;
-      color: var(--muted);
-      margin: 2px 0 12px;
-      line-height: 1.5;
-    }
-    .sm-action {
-      appearance: none;
-      border: 1px solid var(--border);
-      background: var(--card);
-      width: 100%;
-      display: flex;
-      align-items: center;
-      gap: 9px;
-      padding: 9px 12px;
-      margin: 2px 0 12px;
-      border-radius: 6px;
-      font-size: 13px;
-      color: var(--fg);
-      cursor: pointer;
-      text-align: left;
-      white-space: nowrap;
-    }
-    .sm-action:hover:not(:disabled) { background: var(--hover); }
-    .sm-action.primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
-    .sm-action.primary:hover:not(:disabled) { background: var(--accent-hover); }
-    .sm-action:disabled { opacity: 0.5; cursor: default; }
 
     /* ---- transient toast (top-right, shown by expanding the bar a bit) ---- */
     #toast {
@@ -317,7 +371,7 @@
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 8px;
-      box-shadow: 0 8px 24px var(--shadow);
+      box-shadow: 0 8px 24px var(--muted);
       padding: 10px 14px;
       font-size: 13px;
       color: var(--fg);
@@ -329,27 +383,136 @@
       transition: opacity 0.18s ease, transform 0.18s ease;
       cursor: pointer;
     }
-    #toast.visible { opacity: 1; transform: translateY(0); pointer-events: auto; }
+
+    #toast.visible {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
 
     /* ---- about section inside the settings popup ---- */
-    .about-row {
+    /* one card per target (dsh / 桌面版): name + version on the left,
+       per-target update button on the right (shown only when an update exists) */
+    .about-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bar);
+      margin-bottom: 4px;
+    }
+
+    .ai-left {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .ai-name {
       font-size: 13px;
-      margin-bottom: 8px;
+      font-weight: 600;
+      color: var(--fg);
+      flex: none;
+    }
+
+    .ai-ver {
+      font-size: 12.5px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .ai-btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--fg);
+      font-size: 12.5px;
+      padding: 4px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      flex: none;
+      white-space: nowrap;
+    }
+
+    .ai-btn:hover:not(:disabled) {
+      background: var(--hover);
+    }
+
+    .ai-btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    .ai-btn.primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+
+    .ai-btn:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+
+    .ai-btn[hidden] {
+      display: none;
+    }
+
+    /* right-side action cluster of each about card (检查更新 + 更新) */
+    .ai-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: none;
+      min-width: 0;
+    }
+
+    .ai-status {
+      font-size: 12px;
+      line-height: 1.5;
+      min-height: 18px;
+      margin: 2px 0 8px;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+
+    .ai-status.ok {
+      color: var(--ok);
+    }
+
+    .ai-status.new {
+      color: var(--accent);
+    }
+
+    .ai-status.err {
+      color: var(--danger);
+    }
+
+    /* repo link + release notes */
+    .about-row {
       display: flex;
       align-items: baseline;
       gap: 6px;
-    }
-    .about-row span.value { font-weight: 600; }
-    #about-status, #dsh-status {
       font-size: 13px;
-      line-height: 1.5;
-      min-height: 20px;
-      margin-bottom: 6px;
-      color: var(--fg);
-      white-space: pre-wrap;
+      margin: 6px 0 12px;
     }
-    #about-notes {
-      max-height: 140px;
+
+    .about-row a {
+      color: var(--accent);
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    .about-row a:hover {
+      text-decoration: underline;
+    }
+
+    .about-notes {
+      max-height: 120px;
       overflow-y: auto;
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -358,82 +521,71 @@
       font-size: 12.5px;
       line-height: 1.6;
       color: var(--fg);
-      margin-bottom: 10px;
+      margin-bottom: 12px;
       white-space: pre-wrap;
       word-break: break-word;
     }
-    .about-actions {
-      display: flex;
-      gap: 8px;
-      justify-content: flex-end;
-      margin-bottom: 4px;
-    }
-    .about-actions button {
-      appearance: none;
-      border: 1px solid var(--border);
-      background: var(--card);
-      color: var(--fg);
-      font-size: 13px;
-      padding: 6px 14px;
-      border-radius: 6px;
-      cursor: pointer;
-    }
-    .about-actions button:hover:not(:disabled) { background: var(--hover); }
-    .about-actions button.primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
-    .about-actions button.primary:hover:not(:disabled) { background: var(--accent-hover); }
-    .about-actions button:disabled { opacity: 0.5; cursor: default; }
 
-    /* repo link inside the about section */
-    .about-row a {
-      color: var(--accent);
-      text-decoration: none;
-      cursor: pointer;
-    }
-    .about-row a:hover { text-decoration: underline; }
-
-    /* ---- update progress bar (dsh + app panels) ---- */
-    #about-progress, #dsh-progress {
+    /* ---- per-target progress bar (dsh + 桌面版 cards) ---- */
+    .about-progress {
       display: none;
-      height: 6px;
+      height: 4px;
       background: var(--border);
-      border-radius: 3px;
+      border-radius: 2px;
       overflow: hidden;
-      margin-bottom: 10px;
+      margin: 0 0 10px;
     }
-    #about-progress.visible, #dsh-progress.visible { display: block; }
-    #about-progress-fill, #dsh-progress-fill {
+
+    .about-progress.visible {
+      display: block;
+    }
+
+    .about-progress-fill {
       height: 100%;
       width: 0%;
       background: var(--accent);
-      border-radius: 3px;
+      border-radius: 2px;
       transition: width 0.2s ease;
     }
+
     /* indeterminate mode: a short segment sliding across the track */
-    #about-progress.indeterminate #about-progress-fill,
-    #dsh-progress.indeterminate #dsh-progress-fill {
+    .about-progress.indeterminate .about-progress-fill {
       width: 40%;
       animation: about-progress-slide 1.1s ease-in-out infinite;
     }
+
     @keyframes about-progress-slide {
-      0% { transform: translateX(-110%); }
-      100% { transform: translateX(260%); }
+      0% {
+        transform: translateX(-110%);
+      }
+
+      100% {
+        transform: translateX(260%);
+      }
     }
+
+    /* NOTE: there is deliberately NO @media (prefers-reduced-motion) override
+       that sets transition: none for the popup. Windows reports
+       prefers-reduced-motion: reduce when the OS-level "show animations"
+       setting is off, and that override used to silently kill the popup
+       open/close fade here. The popup transitions are short and low-impact,
+       and the user explicitly asked for them to work, so they always run. */
   </style>
 </head>
+
 <body>
   <div id="bar" data-tauri-drag-region="deep">
     <div class="nav" data-tauri-drag-region="false">
       <button id="btn-chat">Chat</button>
       <button id="btn-harness" class="active">Harness</button>
-      <button id="btn-more" title="更多" aria-label="更多">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-          <circle cx="8" cy="3.4" r="1.5" />
-          <circle cx="8" cy="8" r="1.5" />
-          <circle cx="8" cy="12.6" r="1.5" />
+      <button id="btn-settings" title="设置" aria-label="设置">
+        <svg class="gear" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <!-- gear: 8 teeth + rim + hub (stroke-width: teeth 1.9, rim/hub 1.2) -->
+          <path stroke-width="1.9"
+            d="M12.6 8L14.8 8M11.25 11.25L12.81 12.81M8 12.6L8 14.8M4.75 11.25L3.19 12.81M3.4 8L1.2 8M4.75 4.75L3.19 3.19M8 3.4L8 1.2M11.25 4.75L12.81 3.19" />
+          <circle cx="8" cy="8" r="4.7" stroke-width="1.2" />
+          <circle cx="8" cy="8" r="2.2" stroke-width="1.2" />
         </svg>
       </button>
     </div>
@@ -461,11 +613,13 @@
   <div id="settings-modal" hidden>
     <div class="sm-head">
       <h2>
-        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="8" cy="8" r="2.5" />
-          <path d="M8 1.9v1.5M8 12.6v1.5M1.9 8h1.5M12.6 8h1.5M3.7 3.7l1.05 1.05M11.25 11.25l1.05 1.05M12.3 3.7l-1.05 1.05M4.75 11.25l-1.05 1.05" />
+        <svg class="gear" width="19" height="19" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path stroke-width="1.9"
+            d="M12.6 8L14.8 8M11.25 11.25L12.81 12.81M8 12.6L8 14.8M4.75 11.25L3.19 12.81M3.4 8L1.2 8M4.75 4.75L3.19 3.19M8 3.4L8 1.2M11.25 4.75L12.81 3.19" />
+          <circle cx="8" cy="8" r="4.7" stroke-width="1.2" />
+          <circle cx="8" cy="8" r="2.2" stroke-width="1.2" />
         </svg>
-        设置
       </h2>
       <button id="settings-close" title="关闭" aria-label="关闭">✕</button>
     </div>
@@ -473,12 +627,10 @@
     <div class="sm-body">
       <div class="sm-tabs">
         <button class="sm-tab active" data-tab="settings">设置</button>
-        <button class="sm-tab" data-tab="update">更新 dsh</button>
         <button class="sm-tab" data-tab="about">关于</button>
       </div>
       <div class="sm-panels">
         <div class="sm-panel active" data-panel="settings">
-          <div class="panel-title">设置</div>
           <label class="opt-row">
             <span class="opt-label">关闭窗口时关闭 dsh 服务</span>
             <input type="checkbox" id="opt-close-dsh" />
@@ -497,32 +649,43 @@
           </div>
         </div>
 
-        <div class="sm-panel" data-panel="update">
-          <div class="panel-title">更新 dsh</div>
-          <button id="menu-update" class="sm-action primary">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-              <path d="M8 12V3" />
-              <path d="M4.5 6.5 8 3l3.5 3.5" />
-              <path d="M3 13h10" />
-            </svg>
-            更新 dsh
-          </button>
-          <div class="panel-hint">检查并更新全局 @deepseek-ai/dsh（npm），更新完成后自动重启服务。</div>
-          <div id="dsh-status"></div>
-          <div id="dsh-progress"><div id="dsh-progress-fill"></div></div>
-        </div>
-
         <div class="sm-panel" data-panel="about">
-          <div class="panel-title">关于</div>
-          <div class="about-row">当前版本:<span class="value" id="about-current">…</span></div>
-          <div class="about-row">仓库:<a id="about-repo" href="#">…</a></div>
-          <div id="about-status"></div>
-          <div id="about-progress"><div id="about-progress-fill"></div></div>
-          <div id="about-notes" hidden></div>
-          <div class="about-actions">
-            <button id="about-check" class="primary">检查更新</button>
-            <button id="about-update" disabled>更新</button>
+          <!-- dsh card: current version + check status + per-target actions.
+               Each card has its own 检查更新 (checks only this target) and a
+               更新 button that appears only when an update is available. -->
+          <div class="about-item">
+            <div class="ai-left">
+              <span class="ai-name">dsh</span>
+              <span class="ai-ver" id="ver-dsh">…</span>
+            </div>
+            <div class="ai-actions">
+              <button class="ai-btn" id="chk-dsh" title="检查 dsh 更新">检查更新</button>
+              <button class="ai-btn primary" id="upd-dsh" hidden>更新 dsh</button>
+            </div>
           </div>
+          <div class="ai-status" id="status-dsh"></div>
+          <div class="about-progress" id="prog-dsh">
+            <div class="about-progress-fill" id="fill-dsh"></div>
+          </div>
+
+          <!-- desktop app card -->
+          <div class="about-item">
+            <div class="ai-left">
+              <span class="ai-name">桌面版</span>
+              <span class="ai-ver" id="ver-app">…</span>
+            </div>
+            <div class="ai-actions">
+              <button class="ai-btn" id="chk-app" title="检查桌面版更新">检查更新</button>
+              <button class="ai-btn primary" id="upd-app" hidden>更新桌面版</button>
+            </div>
+          </div>
+          <div class="ai-status" id="status-app"></div>
+          <div class="about-progress" id="prog-app">
+            <div class="about-progress-fill" id="fill-app"></div>
+          </div>
+
+          <div class="about-row">仓库:<a id="about-repo" href="#">…</a></div>
+          <div id="about-notes" class="about-notes" hidden></div>
         </div>
       </div>
     </div>
@@ -572,12 +735,22 @@
       var win = T.window.getCurrentWindow();
 
       // ---- settings popup (replaces the old 更多 dropdown + about dialog) ----
+      // Fallback hide delay (ms): should be longer than the CSS opacity
+      // transition so closeSettings hides the popup after the fade-out has
+      // finished even if the transitionend event never fires.
+      var SETTINGS_FADE_MS = 150;
       var settingsOpen = false;
       window.__settingsOpen = false; // read by showToast to avoid resizing
       // Pending popup reveal: the popup is shown only after the bar webview
       // has actually grown to full height (see openSettings/revealSettings).
       var settingsRevealTimer = null;
       var settingsRevealHandler = null;
+      // Pending popup hide: runs after the fade-out transition has finished.
+      var settingsTransitionTimer = null;
+      // Pending close transitionend handler (see closeSettings); removed again
+      // when the popup is reopened so a stale close can never hide a re-opened
+      // popup after its open transition finishes.
+      var settingsCloseHandler = null;
 
       function cancelSettingsReveal() {
         if (settingsRevealTimer) { clearTimeout(settingsRevealTimer); settingsRevealTimer = null; }
@@ -590,18 +763,26 @@
       // Make the popup visible and fade it in. Revealing earlier — while the
       // bar webview is still 44px tall — paints the modal clipped at the top
       // for a frame or two and then jumps it to center (the open "flash").
+      // The forced reflow between unhiding and adding .visible matters: without
+      // it the browser coalesces both style changes into one paint, so the
+      // start state (opacity 0 / scaled position) is never actually rendered
+      // and the CSS transition is skipped (the popup just pops in).
       function revealSettings() {
         cancelSettingsReveal();
         var b = document.getElementById("settings-backdrop");
         var m = document.getElementById("settings-modal");
+        // A close fade may still be in flight if we reopen quickly; its
+        // transitionend handler must not hide this freshly re-opened popup.
+        if (settingsCloseHandler) {
+          m.removeEventListener("transitionend", settingsCloseHandler);
+          settingsCloseHandler = null;
+        }
         b.hidden = false;
         m.hidden = false;
-        // Add .visible next frame so the opacity/transform transition runs
-        // from the start state instead of being batched into one paint.
-        requestAnimationFrame(function () {
-          b.classList.add("visible");
-          m.classList.add("visible");
-        });
+        void b.offsetHeight; // commit the transition start state before...
+        void m.offsetHeight; // ...adding .visible, so the fade/scale runs
+        b.classList.add("visible");
+        m.classList.add("visible");
       }
 
       function hideToast() {
@@ -611,19 +792,42 @@
         if (!settingsOpen) invoke("set_bar_height", { height: 44 });
       }
       function closeSettings() {
+        if (!settingsOpen) return;
         cancelSettingsReveal();
+        if (settingsTransitionTimer) { clearTimeout(settingsTransitionTimer); settingsTransitionTimer = null; }
         settingsOpen = false;
         window.__settingsOpen = false;
         var b = document.getElementById("settings-backdrop");
         var m = document.getElementById("settings-modal");
         b.classList.remove("visible");
         m.classList.remove("visible");
-        b.hidden = true;
-        m.hidden = true;
-        invoke("set_bar_height", { height: 44 });
+        // Hide the popup and shrink the bar webview only after the fade-out
+        // transition has actually finished, so the close fades out instead of
+        // vanishing in a single frame. transitionend is the authoritative
+        // signal; a slightly longer fallback timer covers the case where no
+        // transition runs at all (element already hidden / transitions off).
+        var finishHide = function () {
+          if (settingsCloseHandler) {
+            m.removeEventListener("transitionend", settingsCloseHandler);
+            settingsCloseHandler = null;
+          }
+          if (settingsTransitionTimer) { clearTimeout(settingsTransitionTimer); settingsTransitionTimer = null; }
+          b.hidden = true;
+          m.hidden = true;
+          invoke("set_bar_height", { height: 44 });
+        };
+        settingsCloseHandler = function handler(e) {
+          if (e.target === m && e.propertyName === "opacity") {
+            m.removeEventListener("transitionend", handler);
+            settingsCloseHandler = null;
+            finishHide();
+          }
+        };
+        m.addEventListener("transitionend", settingsCloseHandler);
+        settingsTransitionTimer = setTimeout(finishHide, SETTINGS_FADE_MS + 60);
       }
 
-      // Switch the settings popup between its left tabs (设置 / 更新 dsh / 关于).
+      // Switch the settings popup between its left tabs (设置 / 关于).
       function showTab(name) {
         var tabs = document.querySelectorAll(".sm-tab");
         var panels = document.querySelectorAll(".sm-panel");
@@ -647,61 +851,79 @@
         }
       }
 
-      // Render one status line + progress bar (determinate or indeterminate)
-      // for the given panel prefix ("dsh" or "about").
-      function renderStatus(prefix, s, active) {
-        var status = document.getElementById(prefix + "-status");
-        var bar = document.getElementById(prefix + "-progress");
-        if (!status || !bar) return;
-        var fill = document.getElementById(prefix + "-progress-fill");
-        status.textContent = s.message || "";
-        // Show the progress bar while a phase is active, or mid-download.
-        if (active || (s.progress != null && s.progress > 0 && s.progress < 100)) {
-          bar.classList.add("visible");
-          if (s.progress != null) {
-            bar.classList.remove("indeterminate");
-            fill.style.width = Math.max(0, Math.min(100, s.progress)) + "%";
+      // Phases that keep a target busy (drive the progress bar + disable that
+      // target's 检查更新/更新 buttons while any of them is in flight).
+      var ACTIVE_PHASES = ["checking", "downloading", "installing", "restarting", "finalizing"];
+
+      // Fill a version cell ("vX.Y.Z", or 未安装 when the value is missing).
+      function setVersion(key, v) {
+        var el = document.getElementById("ver-" + key);
+        if (!el) return;
+        el.textContent = v ? "v" + v : "未安装";
+      }
+
+      // Render one target card ("dsh" or "app"): version cell, status line,
+      // progress bar, the per-target 检查更新 button and the update button.
+      function renderTarget(key, t) {
+        if (!t) return;
+        var ver = document.getElementById("ver-" + key);
+        var status = document.getElementById("status-" + key);
+        var prog = document.getElementById("prog-" + key);
+        var fill = document.getElementById("fill-" + key);
+        var upd = document.getElementById("upd-" + key);
+        var chk = document.getElementById("chk-" + key);
+        var active = ACTIVE_PHASES.indexOf(t.phase) >= 0;
+
+        // The version cell shows the CURRENT version only (the latest version
+        // is communicated by the status line); keep whatever get_app_info set
+        // while it is still unknown.
+        if (ver && t.current) ver.textContent = "v" + t.current;
+
+        status.textContent = t.message || "";
+        status.classList.toggle("err", t.phase === "error");
+        status.classList.toggle("new", t.phase === "done" && !!t.updateAvailable);
+        status.classList.toggle("ok", t.phase === "done" && !t.updateAvailable);
+
+        // Progress bar: visible while a phase is active, or mid-download.
+        if (active || (t.progress != null && t.progress > 0 && t.progress < 100)) {
+          prog.classList.add("visible");
+          if (t.progress != null) {
+            prog.classList.remove("indeterminate");
+            fill.style.width = Math.max(0, Math.min(100, t.progress)) + "%";
           } else {
-            bar.classList.add("indeterminate");
+            prog.classList.add("indeterminate");
             fill.style.width = "";
           }
         } else {
-          bar.classList.remove("visible", "indeterminate");
+          prog.classList.remove("visible", "indeterminate");
           fill.style.width = "";
         }
+
+        // Per-target 检查更新 button: disabled while this target is busy.
+        if (chk) chk.disabled = active;
+        // Per-target update button: shown only when an update is available.
+        upd.hidden = !(t.updateAvailable && !active);
+        upd.disabled = active;
       }
 
-      // Render the live update/check state into both the 更新 dsh and 关于
-      // panels (status line + progress bar), the release notes, and the
-      // enable/disable + label of the action buttons. Driven by the
-      // `update-progress` event and by `get_update_state` on popup open, so
-      // closing the popup mid-update never loses the status.
-      function renderUpdateState(s) {
-        if (!s) return;
-        var active = ["checking", "downloading", "installing", "restarting", "finalizing"].indexOf(s.phase) >= 0;
-        renderStatus("dsh", s, active);
-        renderStatus("about", s, active);
+      // Render the live per-target state of the 关于 panel (two cards: dsh and
+      // 桌面版) plus the release notes. Driven by the `about-progress` event and
+      // by `get_about_state` on popup open, so closing the popup mid-check or
+      // mid-update never loses the status. Each card's buttons are managed by
+      // renderTarget.
+      function renderAbout(st) {
+        if (!st) return;
+        renderTarget("dsh", st.dsh);
+        renderTarget("app", st.app);
 
         var notes = document.getElementById("about-notes");
-        if (s.release_notes && s.release_notes.trim()) {
-          notes.textContent = s.release_notes;
+        var app = st.app || {};
+        if (app.releaseNotes && app.releaseNotes.trim()) {
+          notes.textContent = app.releaseNotes;
           notes.hidden = false;
         } else {
           notes.hidden = true;
         }
-
-        var checkBtn = document.getElementById("about-check");
-        var upd = document.getElementById("about-update");
-        checkBtn.disabled = active;
-        if (s.latest && s.updateAvailable) {
-          upd.textContent = "更新到 v" + s.latest;
-        } else if (!active) {
-          upd.textContent = "更新";
-        }
-        upd.disabled = active || !s.updateAvailable;
-
-        // dsh update button is disabled while any update is in flight.
-        document.getElementById("menu-update").disabled = active;
       }
 
       function openSettings() {
@@ -709,6 +931,8 @@
         window.__settingsOpen = true;
         hideToast();
         showTab("settings");
+        // Cancel any pending fade-out hide so a quick reopen works smoothly.
+        if (settingsTransitionTimer) { clearTimeout(settingsTransitionTimer); settingsTransitionTimer = null; }
 
         // Expand the bar webview first, and reveal the popup only once it has
         // actually grown (one-shot resize listener + safety timer). This
@@ -728,24 +952,27 @@
           document.getElementById("opt-close-dsh").checked = !!s.closeStopsDsh;
           document.getElementById("opt-auto-update").checked = !!s.autoUpdate;
           setThemeSeg(s.theme || "system");
-        }).catch(function () {});
+        }).catch(function () { });
 
-        // About section: app version + repo, and restore any in-flight/last
-        // update status.
+        // 关于 section: current versions (desktop + dsh) + repo, and restore
+        // any in-flight/last check/update status.
         invoke("get_app_info").then(function (info) {
-          if (info && info.version) {
-            document.getElementById("about-current").textContent = info.version;
-          }
-          if (info && info.repo) {
-            window.__aboutRepo = info.repo;
-            var repoEl = document.getElementById("about-repo");
-            repoEl.textContent = "github";
-            repoEl.href = "https://github.com/" + info.repo;
+          if (info) {
+            setVersion("app", info.version);
+            // dshVersion (camelCase) is the current contract; keep the
+            // snake_case fallback for older builds of the backend.
+            setVersion("dsh", info.dshVersion || info.dsh_version || null);
+            if (info.repo) {
+              window.__aboutRepo = info.repo;
+              var repoEl = document.getElementById("about-repo");
+              repoEl.textContent = "github";
+              repoEl.href = "https://github.com/" + info.repo;
+            }
           }
         }).catch(function () {
-          document.getElementById("about-current").textContent = "未知";
+          setVersion("app", null);
         });
-        invoke("get_update_state").then(renderUpdateState).catch(function () {});
+        invoke("get_about_state").then(renderAbout).catch(function () { });
       }
 
       function saveSettings() {
@@ -774,10 +1001,11 @@
         setActive("harness");
         invoke("switch_to", { target: "harness" });
       });
-      document.getElementById("btn-more").addEventListener("click", function () {
+      document.getElementById("btn-settings").addEventListener("click", function () {
         if (settingsOpen) { closeSettings(); } else { openSettings(); }
       });
-      document.getElementById("settings-backdrop").addEventListener("click", closeSettings);
+      // Clicking outside the panel (the dimmed backdrop) intentionally does NOT
+      // close it: only ✕ / Esc / nav switch / window controls dismiss the panel.
       document.getElementById("settings-close").addEventListener("click", closeSettings);
       // Left tabs switch the right content panel.
       var tabEls = document.querySelectorAll(".sm-tab");
@@ -791,36 +1019,45 @@
       });
 
       // ---- popup actions ----
-      document.getElementById("menu-update").addEventListener("click", function () {
-        // Optimistically render; the real state comes via events.
-        renderUpdateState({ phase: "checking", message: "正在检查 dsh 版本…", update_available: false });
-        invoke("update_dsh").catch(function (e) {
-          renderUpdateState({ phase: "error", message: "dsh 更新失败:" + e, update_available: false });
-        });
-      });
       document.getElementById("about-repo").addEventListener("click", function (e) {
         e.preventDefault();
         var repo = window.__aboutRepo || "";
         if (repo) invoke("open_url", { url: "https://github.com/" + repo });
       });
-      // Live update/check progress: the backend publishes an `update-progress`
+      // Live check/update progress: the backend publishes an `about-progress`
       // event on every state change; render it even when the popup is open.
       if (T.event) {
-        T.event.listen("update-progress", function (e) {
-          renderUpdateState(e.payload);
+        T.event.listen("about-progress", function (e) {
+          renderAbout(e.payload);
         });
       }
-      document.getElementById("about-check").addEventListener("click", function () {
-        // Optimistically disable the button; the real state comes via events.
-        renderUpdateState({ phase: "checking", message: "正在检查更新…", update_available: false });
-        invoke("check_update").catch(function (e) {
-          renderUpdateState({ phase: "error", message: "检查更新失败:" + e, update_available: false });
+      // Per-target 检查更新 buttons: each card checks only its own target, so
+      // dsh and the desktop app can be checked (and updated) independently.
+      document.getElementById("chk-dsh").addEventListener("click", function () {
+        // Optimistically render; the real state comes via events.
+        renderTarget("dsh", { phase: "checking", message: "正在检查 dsh 更新…" });
+        invoke("check_updates", { target: "dsh" }).catch(function (e) {
+          renderTarget("dsh", { phase: "error", message: "检查 dsh 更新失败:" + e });
         });
       });
-      document.getElementById("about-update").addEventListener("click", function () {
-        renderUpdateState({ phase: "checking", message: "正在准备更新…", update_available: false });
+      document.getElementById("chk-app").addEventListener("click", function () {
+        // Optimistically render; the real state comes via events.
+        renderTarget("app", { phase: "checking", message: "正在检查桌面版更新…" });
+        invoke("check_updates", { target: "app" }).catch(function (e) {
+          renderTarget("app", { phase: "error", message: "检查桌面版更新失败:" + e });
+        });
+      });
+      // Per-target update buttons (shown only when an update is available).
+      document.getElementById("upd-dsh").addEventListener("click", function () {
+        renderTarget("dsh", { phase: "checking", message: "正在准备更新 dsh…", updateAvailable: false });
+        invoke("update_dsh").catch(function (e) {
+          renderTarget("dsh", { phase: "error", message: "dsh 更新失败:" + e, updateAvailable: false });
+        });
+      });
+      document.getElementById("upd-app").addEventListener("click", function () {
+        renderTarget("app", { phase: "checking", message: "正在获取版本信息…", updateAvailable: false });
         invoke("update_app").catch(function (e) {
-          renderUpdateState({ phase: "error", message: "更新失败:" + e, update_available: false });
+          renderTarget("app", { phase: "error", message: "更新桌面版失败:" + e, updateAvailable: false });
         });
       });
 
@@ -860,4 +1097,5 @@
     })();
   </script>
 </body>
+
 </html>
