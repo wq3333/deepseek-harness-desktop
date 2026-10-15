@@ -37,6 +37,31 @@ const DARK_BG: tauri::window::Color = tauri::window::Color(13, 17, 23, 255);
 const MIN_WINDOW_W: f64 = 800.0;
 const MIN_WINDOW_H: f64 = 600.0;
 
+/// Fallback "1K" normal window size (logical px) used when the persisted
+/// geometry cannot be trusted (see `restore_window_geometry`). It is further
+/// clamped to the monitor work area, so a smaller screen never gets a window
+/// bigger than itself.
+const FALLBACK_WINDOW_W: f64 = 1920.0;
+const FALLBACK_WINDOW_H: f64 = 1080.0;
+
+/// Tolerance (logical px, multiplied by the monitor scale factor) for the
+/// invisible DWM resize border of a borderless window: a window snapped to the
+/// left/top screen edge legitimately reports an outer position of about
+/// -8..-10 physical px, which must not be mistaken for a corrupted rect.
+const GEOMETRY_BORDER_TOLERANCE: f64 = 8.0;
+
+/// How long records are ignored after the maximized state flips. On Windows the
+/// un-maximize transition reports a `Resized` event whose size is still the
+/// maximized rect (work area + invisible border) while `IsZoomed` is already
+/// false; persisting that frame is what made the restored window larger than
+/// the maximized one.
+const GEOMETRY_SETTLE: Duration = Duration::from_millis(350);
+
+/// How long after a maximized-state flip the snap-back guard stays armed. It
+/// only exists to fix the maximize/restore transition, so keeping it narrow
+/// means a DPI change, a monitor move or a manual resize can never trigger it.
+const GEOMETRY_CORRECT_WINDOW: Duration = Duration::from_secs(3);
+
 /// How long window move/resize events are debounced before writing the
 /// geometry to disk (they fire many times per second while dragging).
 const GEOMETRY_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -323,9 +348,16 @@ impl Default for WindowState {
 }
 
 /// Pending window geometry + time of the last disk write (debounced).
+///
+/// `last_maximized` / `max_changed_at` track the last observed maximize state
+/// and when it flipped, so the transient rect Windows reports between
+/// "unmaximize" and the final restored placement is never recorded (see
+/// `GEOMETRY_SETTLE`).
 struct WindowStateCache {
     pending: Option<WindowState>,
     last_saved: Option<Instant>,
+    last_maximized: Option<bool>,
+    max_changed_at: Option<Instant>,
 }
 
 /// Shared window-geometry cache, managed by Tauri.
@@ -408,10 +440,247 @@ fn saved_geometry_visible(state: &WindowState, window: &tauri::Window) -> bool {
     )
 }
 
+// --- normal-geometry sanity (guards against the maximize/restore artifact) ---
+
+/// A monitor work area in physical pixels plus its scale factor.
+#[derive(Clone, Copy)]
+struct WorkArea {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    scale: f64,
+}
+
+impl WorkArea {
+    fn from_monitor(monitor: &tauri::Monitor) -> Self {
+        let wa = monitor.work_area();
+        WorkArea {
+            x: wa.position.x as f64,
+            y: wa.position.y as f64,
+            w: wa.size.width as f64,
+            h: wa.size.height as f64,
+            scale: monitor.scale_factor().max(0.1),
+        }
+    }
+}
+
+/// Overlap of a physical rect with a work area (0 when they do not overlap).
+fn overlap_area(px: f64, py: f64, pw: f64, ph: f64, wa: &WorkArea) -> f64 {
+    let ox = (px + pw).min(wa.x + wa.w) - px.max(wa.x);
+    let oy = (py + ph).min(wa.y + wa.h) - py.max(wa.y);
+    if ox <= 0.0 || oy <= 0.0 {
+        0.0
+    } else {
+        ox * oy
+    }
+}
+
+/// Monitor with the largest overlap for a *physical* rect.
+fn work_area_for_physical_rect(
+    window: &tauri::Window,
+    px: f64,
+    py: f64,
+    pw: f64,
+    ph: f64,
+) -> Option<WorkArea> {
+    let mut best: Option<(f64, WorkArea)> = None;
+    for monitor in window.available_monitors().unwrap_or_default() {
+        let wa = WorkArea::from_monitor(&monitor);
+        let overlap = overlap_area(px, py, pw, ph, &wa);
+        if overlap > 0.0 && best.as_ref().map_or(true, |(b, _)| overlap > *b) {
+            best = Some((overlap, wa));
+        }
+    }
+    best.map(|(_, wa)| wa)
+}
+
+/// Work area of the monitor that owns `rect` (logical coords): the monitor with
+/// the largest overlap wins, so a window on a monitor to the left / above the
+/// primary one keeps working with its legitimately negative coordinates.
+/// Returns None when the rect overlaps no monitor at all.
+fn work_area_for_rect(
+    window: &tauri::Window,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> Option<WorkArea> {
+    let mut best: Option<(f64, WorkArea)> = None;
+    for monitor in window.available_monitors().unwrap_or_default() {
+        let wa = WorkArea::from_monitor(&monitor);
+        let scale = wa.scale;
+        let overlap = overlap_area(x * scale, y * scale, w * scale, h * scale, &wa);
+        if overlap > 0.0 && best.as_ref().map_or(true, |(b, _)| overlap > *b) {
+            best = Some((overlap, wa));
+        }
+    }
+    best.map(|(_, wa)| wa)
+}
+
+/// Work area of the primary monitor (falls back to the window's current
+/// monitor, then to a 1920x1080 @1.0 assumption when no monitor is reported).
+fn primary_work_area(window: &tauri::Window) -> WorkArea {
+    window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten())
+        .map(|m| WorkArea::from_monitor(&m))
+        .unwrap_or(WorkArea {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+            scale: 1.0,
+        })
+}
+
+/// True when a *normal* (non-maximized) window could plausibly sit at this
+/// physical rect: neither axis may exceed the work area, and the top-left
+/// corner may not start more than `border` px outside the work-area origin.
+/// `border` absorbs the invisible DWM resize frame of a borderless window.
+fn rect_fits_work_area(
+    px: f64,
+    py: f64,
+    pw: f64,
+    ph: f64,
+    wa: &WorkArea,
+    border: f64,
+) -> bool {
+    if pw > wa.w || ph > wa.h {
+        return false;
+    }
+    px >= wa.x - border && py >= wa.y - border
+}
+
+/// The artifact signature on its own: a normal window can never be wider or
+/// taller than its monitor work area. Used by the runtime correction, which
+/// must not fight a user-dragged window (a window may legally hang off the
+/// right/bottom edge, but never be bigger than the work area).
+fn rect_size_exceeds_work_area(pw: f64, ph: f64, wa: &WorkArea) -> bool {
+    pw > wa.w || ph > wa.h
+}
+
+/// Fallback "1K" normal bounds (logical px) for an unusable geometry, centered
+/// on `wa` and clamped to it and to MIN_WINDOW_W/H.
+fn fallback_normal_bounds(wa: &WorkArea) -> (f64, f64, f64, f64) {
+    let scale = wa.scale.max(0.1);
+    let w = FALLBACK_WINDOW_W.min(wa.w / scale).max(MIN_WINDOW_W);
+    let h = FALLBACK_WINDOW_H.min(wa.h / scale).max(MIN_WINDOW_H);
+    let x = wa.x / scale + ((wa.w / scale) - w) / 2.0;
+    let y = wa.y / scale + ((wa.h / scale) - h) / 2.0;
+    (x, y, w, h)
+}
+
+/// Centered normal bounds (logical px) of a given size on `wa`, clamped to the
+/// work area — used for the first run and for off-screen saved positions.
+fn centered_normal_bounds(wa: &WorkArea, w: f64, h: f64) -> (f64, f64, f64, f64) {
+    let scale = wa.scale.max(0.1);
+    let w = w.min(wa.w / scale).max(MIN_WINDOW_W);
+    let h = h.min(wa.h / scale).max(MIN_WINDOW_H);
+    let x = wa.x / scale + ((wa.w / scale) - w) / 2.0;
+    let y = wa.y / scale + ((wa.h / scale) - h) / 2.0;
+    (x, y, w, h)
+}
+
+/// True when the maximized state has not flipped recently — i.e. the geometry
+/// reported by the current `Resized` event is the final placement, not the
+/// transient frame Windows reports while un-maximizing. Marks the flip itself.
+fn maximize_state_settled(cache: &mut WindowStateCache, maximized: bool) -> bool {
+    if cache.last_maximized != Some(maximized) {
+        cache.last_maximized = Some(maximized);
+        cache.max_changed_at = Some(Instant::now());
+    }
+    cache
+        .max_changed_at
+        .map_or(true, |t| t.elapsed() >= GEOMETRY_SETTLE)
+}
+
+/// Apply a logical rect to the window.
+fn apply_logical_bounds(window: &tauri::Window, x: f64, y: f64, w: f64, h: f64) {
+    let _ = window.set_size(tauri::LogicalSize::new(w, h));
+    let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+}
+
+/// Overwrite the pending window state (and the file) with an already validated
+/// normal rect. Seeding it right after the startup restore keeps the pending
+/// state non-empty at all times, so a session that stays maximized (or exits
+/// while maximized) still persists real normal bounds instead of zeros.
+fn seed_window_state(
+    app: &tauri::AppHandle,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    maximized: bool,
+) {
+    let state = WindowState {
+        maximized,
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    save_window_state(app, &state);
+    let store = app.state::<WindowStateStore>();
+    let mut cache = store.0.lock().unwrap();
+    cache.pending = Some(state);
+    cache.last_saved = Some(Instant::now());
+}
+
+/// True when the window's *current* physical rect is impossible for a normal
+/// window (the maximize/restore artifact) — see `rect_size_exceeds_work_area`.
+fn window_rect_size_exceeds_work_area(window: &tauri::Window) -> bool {
+    let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return false;
+    };
+    // Physical units throughout: outer_position/outer_size are physical, and so
+    // is the work area.
+    let Some(wa) = work_area_for_physical_rect(
+        window,
+        pos.x as f64,
+        pos.y as f64,
+        size.width as f64,
+        size.height as f64,
+    ) else {
+        return false;
+    };
+    rect_size_exceeds_work_area(size.width as f64, size.height as f64, &wa)
+}
+
+/// Re-apply the last validated normal bounds (falling back to the centered 1K
+/// rect) after a restore produced an impossible size.
+fn apply_remembered_normal_bounds(window: &tauri::Window, app: &tauri::AppHandle) {
+    let remembered = {
+        let store = app.state::<WindowStateStore>();
+        let cache = store.0.lock().unwrap();
+        cache.pending.clone()
+    };
+    match remembered {
+        Some(s) => apply_logical_bounds(
+            window,
+            s.x,
+            s.y,
+            s.width.max(MIN_WINDOW_W),
+            s.height.max(MIN_WINDOW_H),
+        ),
+        None => {
+            let (x, y, w, h) = fallback_normal_bounds(&primary_work_area(window));
+            apply_logical_bounds(window, x, y, w, h);
+        }
+    }
+}
+
 /// Record the window's current geometry into the shared store, writing to
 /// disk at most once per debounce interval. Minimized windows are skipped
 /// (Windows reports a near-zero size for them); a maximized window only flips
 /// the flag so the last known normal bounds survive for the unmaximize case.
+///
+/// A non-maximized record is only accepted when the maximized state has been
+/// stable for `GEOMETRY_SETTLE` and the rect is a plausible normal placement
+/// (see `rect_fits_work_area`); otherwise the previous good bounds are kept, so
+/// the transient maximized-size rect can never be persisted.
 fn record_window_geometry(window: &tauri::Window, app: &tauri::AppHandle) {
     if window.is_minimized().unwrap_or(true) {
         return;
@@ -419,17 +688,32 @@ fn record_window_geometry(window: &tauri::Window, app: &tauri::AppHandle) {
     let maximized = window.is_maximized().unwrap_or(false);
     let store = app.state::<WindowStateStore>();
     let mut cache = store.0.lock().unwrap();
+    let settled = maximize_state_settled(&mut cache, maximized);
     let state = cache.pending.get_or_insert_with(WindowState::default);
     state.maximized = maximized;
-    if !maximized {
+    if !maximized && settled {
         if let (Ok(pos), Ok(size), Ok(scale)) =
             (window.outer_position(), window.outer_size(), window.scale_factor())
         {
             let scale = scale.max(0.1);
-            state.x = pos.x as f64 / scale;
-            state.y = pos.y as f64 / scale;
-            state.width = size.width as f64 / scale;
-            state.height = size.height as f64 / scale;
+            let px = pos.x as f64;
+            let py = pos.y as f64;
+            let pw = size.width as f64;
+            let ph = size.height as f64;
+            let acceptable = match work_area_for_physical_rect(window, px, py, pw, ph) {
+                Some(wa) => {
+                    rect_fits_work_area(px, py, pw, ph, &wa, GEOMETRY_BORDER_TOLERANCE * wa.scale)
+                }
+                // No monitor overlap at all (off-screen drag): keep the last
+                // known good bounds instead of persisting an unreachable rect.
+                None => false,
+            };
+            if acceptable {
+                state.x = px / scale;
+                state.y = py / scale;
+                state.width = pw / scale;
+                state.height = ph / scale;
+            }
         }
     }
     if cache
@@ -458,25 +742,80 @@ fn flush_window_state(app: &tauri::AppHandle) {
     }
 }
 
-/// Apply the persisted geometry to a (hidden, already built) window: normal
-/// bounds when they are valid, else centered. First run (no state) stays
-/// centered. Returns true when the saved state was maximized — the caller
-/// defers the actual maximize until the first page has finished loading, so
-/// the maximized window never appears empty (no startup flash).
+/// Apply the persisted geometry to a (hidden, already built) window.
+///
+/// The saved rect is validated first: a rect that cannot be a normal window
+/// placement (the maximize/restore artifact: negative position beyond the
+/// invisible border, or a size larger than the monitor work area) is discarded
+/// in favour of the centered 1K fallback (clamped to the work area). A valid
+/// rect that is merely off-screen keeps its size and is centered. First run
+/// (no state) starts at 1280x720 centered.
+///
+/// The validated rect is seeded into the shared store, so the pending state is
+/// never empty and a maximized session still persists real normal bounds.
+/// Returns true when the saved state was maximized — the caller defers the
+/// actual maximize until the first page has finished loading, so the maximized
+/// window never appears empty (no startup flash).
 fn restore_window_geometry(window: &tauri::Window, app: &tauri::AppHandle) -> bool {
-    let Some(state) = load_window_state(app) else {
-        let _ = window.center();
-        return false;
+    let maximized = match load_window_state(app) {
+        Some(state) => {
+            let mut x = state.x;
+            let mut y = state.y;
+            let mut w = state.width.max(MIN_WINDOW_W);
+            let mut h = state.height.max(MIN_WINDOW_H);
+            let explicit_position;
+
+            match work_area_for_rect(window, state.x, state.y, state.width, state.height) {
+                Some(wa) => {
+                    let fits = rect_fits_work_area(
+                        state.x * wa.scale,
+                        state.y * wa.scale,
+                        state.width * wa.scale,
+                        state.height * wa.scale,
+                        &wa,
+                        GEOMETRY_BORDER_TOLERANCE * wa.scale,
+                    );
+                    if !fits {
+                        // Unusable saved rect (typically the maximized frame
+                        // recorded as a normal one): fall back to 1K centered.
+                        let (fx, fy, fw, fh) = fallback_normal_bounds(&wa);
+                        x = fx;
+                        y = fy;
+                        w = fw;
+                        h = fh;
+                        explicit_position = true;
+                    } else {
+                        // Valid and on a monitor: keep the size, keep the
+                        // position unless it is unreachable (48px margin rule).
+                        explicit_position = saved_geometry_visible(&state, window);
+                    }
+                }
+                // Overlaps no monitor at all: keep the size, center it.
+                None => explicit_position = false,
+            }
+
+            if explicit_position {
+                apply_logical_bounds(window, x, y, w, h);
+            } else {
+                let (cx, cy, cw, ch) = centered_normal_bounds(&primary_work_area(window), w, h);
+                x = cx;
+                y = cy;
+                w = cw;
+                h = ch;
+                apply_logical_bounds(window, x, y, w, h);
+            }
+            seed_window_state(app, x, y, w, h, state.maximized);
+            state.maximized
+        }
+        None => {
+            let (x, y, w, h) = centered_normal_bounds(&primary_work_area(window), 1280.0, 720.0);
+            apply_logical_bounds(window, x, y, w, h);
+            seed_window_state(app, x, y, w, h, false);
+            false
+        }
     };
-    let w = state.width.max(MIN_WINDOW_W);
-    let h = state.height.max(MIN_WINDOW_H);
-    let _ = window.set_size(tauri::LogicalSize::new(w, h));
-    if saved_geometry_visible(&state, window) {
-        let _ = window.set_position(tauri::LogicalPosition::new(state.x, state.y));
-    } else {
-        let _ = window.center();
-    }
-    state.maximized
+    maximize_state_settled(&mut app.state::<WindowStateStore>().0.lock().unwrap(), maximized);
+    maximized
 }
 
 fn default_setup_items() -> Vec<SetupItem> {
@@ -514,6 +853,22 @@ fn publish_setup(app: &tauri::AppHandle, state: SetupState) {
 /// Append one detail line to the loading page's live log (`setup-log` event).
 fn setup_log(app: &tauri::AppHandle, line: impl Into<String>) {
     let _ = app.emit("setup-log", line.into());
+}
+
+/// Update a single checklist row in the *shared* setup state and broadcast it.
+///
+/// `publish_setup` hands a whole locally-owned `SetupState` to the page, which
+/// only works while one thread owns the flow. The parallel Node/dsh probes each
+/// need to report independently, so they go through this mutex-guarded helper;
+/// the flow thread joins them and then reloads the shared state to resume
+/// single-writer publishing.
+fn publish_setup_item(app: &tauri::AppHandle, key: &str, status: &str, detail: impl Into<String>) {
+    let shared = app.state::<SharedSetupState>();
+    let mut state = shared.0.lock().unwrap();
+    set_setup_item(&mut state, key, status, detail);
+    let snapshot = state.clone();
+    drop(state);
+    let _ = app.emit("setup-progress", snapshot);
 }
 
 /// True while a check/update is in flight for one target (prevents starting
@@ -633,6 +988,32 @@ fn add_user_path(dir: String) {
     let _ = run_ps(&ps);
 }
 
+/// `refresh_process_path` exactly once per process. Called at the very start of
+/// the background setup thread (before any probe spawns a child), so the
+/// PowerShell start-up no longer delays the window and the loading page, while
+/// every child spawned afterwards still sees the merged PATH.
+fn refresh_process_path_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(refresh_process_path);
+}
+
+/// Compute the installed dsh version without spawning npm when possible.
+fn dsh_version_from_files() -> Option<String> {
+    for root in npm_global_roots() {
+        let pkg = root
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("package.json");
+        if let Some(text) = read_text_utf8(&pkg) {
+            if let Some(v) = parse_package_version(&text) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// Check whether the WebView2 runtime is installed (Evergreen), via the
 /// standard EdgeUpdate client registry keys (x64, x86, per-user) plus a
 /// filesystem fallback for unusual (e.g. fixed-version) installs.
@@ -726,6 +1107,29 @@ fn parse_npm_version(stdout: &str) -> Option<String> {
             Some(v.to_string())
         }
     })
+}
+
+/// Parse the `version` field of a package.json (used by the npm-free dsh
+/// detection fast path).
+fn parse_package_version(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let s = v.get("version")?.as_str()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// The two npm global roots dsh can be installed into: npm's default global
+/// prefix (`%APPDATA%\npm`) and the no-admin user prefix this app falls back to.
+fn npm_global_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        roots.push(std::path::PathBuf::from(appdata).join("npm"));
+    }
+    roots.push(user_npm_prefix());
+    roots
 }
 
 fn active_port() -> u16 {
@@ -1141,6 +1545,26 @@ fn attach_window_handlers(
                 if window_for_layout.is_minimized().unwrap_or(true) {
                     return;
                 }
+                // Un-maximize guard: once the transition has settled, a window
+                // that is still bigger than its monitor work area would cover
+                // the taskbar and look larger than the maximized one — snap it
+                // back to the last validated normal bounds. Only the size is
+                // checked, so a user-dragged window (which may hang off the
+                // right/bottom edge) is never fought.
+                if !window_for_layout.is_maximized().unwrap_or(false) {
+                    let transition = {
+                        let store = app_handle_for_layout.state::<WindowStateStore>();
+                        let mut cache = store.0.lock().unwrap();
+                        let settled = maximize_state_settled(&mut cache, false);
+                        let recent = cache
+                            .max_changed_at
+                            .map_or(false, |t| t.elapsed() < GEOMETRY_CORRECT_WINDOW);
+                        settled && recent
+                    };
+                    if transition && window_rect_size_exceeds_work_area(&window_for_layout) {
+                        apply_remembered_normal_bounds(&window_for_layout, &app_handle_for_layout);
+                    }
+                }
                 let bar_height = app_handle_for_layout
                     .state::<BarHeight>()
                     .0
@@ -1317,6 +1741,24 @@ fn add_webviews(
     relayout(&window, &bar, &harness, &chat, TITLE_BAR_HEIGHT);
     attach_window_handlers(window, bar, harness, chat, app_handle);
     Ok(())
+}
+
+/// Toggle the main window between maximized and restored, returning the new
+/// maximized state so the title bar can swap its icon in the same round trip
+/// (a plain isMaximized()+maximize()/unmaximize() pair from JS is a race).
+/// The un-maximize geometry itself is validated by the `Resized` handler.
+#[tauri::command]
+fn toggle_maximize(app: tauri::AppHandle) -> bool {
+    let Some(window) = app.get_window("main") else {
+        return false;
+    };
+    if window.is_maximized().unwrap_or(false) {
+        let _ = window.unmaximize();
+        false
+    } else {
+        let _ = window.maximize();
+        true
+    }
 }
 
 /// Resize the title bar webview to a given height. `height <= 0` means the
@@ -1925,9 +2367,17 @@ fn install_node_zip(app: &tauri::AppHandle, version: &str, base_url: &str) -> Re
     Ok(node_version())
 }
 
-/// Installed dsh version (global npm prefix, falling back to the user prefix
-/// used when a global install was not permitted).
+/// Installed dsh version.
+///
+/// Fast path first: the two default npm global roots are read directly from
+/// disk (`@deepseek-ai/dsh/package.json`), which costs ~1ms instead of the
+/// 0.5-1.5s it takes to start npm through `cmd`. When neither file exists (a
+/// custom npm prefix, a partial install, an unusual layout) it falls back to
+/// `npm ls -g` across the global prefix and then the user prefix.
 fn dsh_version() -> Option<String> {
+    if let Some(v) = dsh_version_from_files() {
+        return Some(v);
+    }
     let out = run_capture("cmd", &["/c", "npm", "ls", "-g", "@deepseek-ai/dsh", "--depth=0"]).ok()?;
     if let Some(v) = parse_npm_version(&out) {
         return Some(v);
@@ -2016,6 +2466,14 @@ fn setup_and_start(app: tauri::AppHandle, port: u16) {
 }
 
 fn setup_and_start_inner(app: &tauri::AppHandle, port: u16) -> Result<(), String> {
+    // Merge machine + user PATH from the registry into this process before any
+    // probe spawns a child, so tools this app installs (Node.js, npm,
+    // user-prefix dsh) are found without restarting. Done here — not before the
+    // window is built — because spawning PowerShell takes ~1s and would delay
+    // the window and the loading page; this thread already runs in the
+    // background.
+    refresh_process_path_once();
+
     let mut state = default_setup_state();
 
     // Fast path: dsh is already running on the port — connect, resolving the
@@ -2050,16 +2508,62 @@ fn setup_and_start_inner(app: &tauri::AppHandle, port: u16) -> Result<(), String
     set_setup_item(&mut state, "webview2", "ok", "已就绪");
     publish_setup(app, state.clone());
 
-    // Node.js
-    setup_log(app, "[1/3] 检测 Node.js…");
-    set_setup_item(&mut state, "node", "checking", "检测中…");
-    publish_setup(app, state.clone());
-    if node_available() {
-        let v = node_version();
-        setup_log(app, format!("  已就绪({v})"));
-        set_setup_item(&mut state, "node", "ok", v);
-    } else {
-        setup_log(app, "  未检测到 Node.js，开始自动安装…");
+    // --- Node.js + dsh: two independent probes, run in parallel ---
+    // They used to run back to back; the npm-based dsh probe alone costs
+    // 0.5-1.5s (npm is started through cmd), so overlapping them halves the
+    // wall clock. Each worker publishes only its own checklist row (through
+    // `publish_setup_item`, which is mutex-guarded); the main thread joins both
+    // and reloads the shared state before continuing, so the install and start
+    // phases below keep their single-writer semantics.
+    setup_log(app, "并行检测 Node.js 与 dsh 运行环境…");
+    publish_setup_item(app, "node", "checking", "检测中…");
+    publish_setup_item(app, "dsh", "checking", "检测中…");
+
+    let node_probe = {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let version = if node_available() {
+                let v = node_version();
+                publish_setup_item(&app, "node", "ok", v.clone());
+                setup_log(&app, format!("  Node.js 已就绪({v})"));
+                Some(v)
+            } else {
+                publish_setup_item(&app, "node", "pending", "未检测到");
+                setup_log(&app, "  未检测到 Node.js");
+                None
+            };
+            version
+        })
+    };
+    let dsh_probe = {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            match dsh_version() {
+                Some(v) => {
+                    publish_setup_item(&app, "dsh", "ok", format!("v{v}"));
+                    setup_log(&app, format!("  dsh 已就绪(v{v})"));
+                    Some(v)
+                }
+                None => {
+                    publish_setup_item(&app, "dsh", "pending", "未检测到");
+                    setup_log(&app, "  未检测到 dsh");
+                    None
+                }
+            }
+        })
+    };
+    let node_found = node_probe.join().unwrap_or(None);
+    let mut dsh_found = dsh_probe.join().unwrap_or(None);
+    // Pick up the rows the workers wrote into the shared state.
+    state = app.state::<SharedSetupState>().0.lock().unwrap().clone();
+    // Set when a Node install invalidates the parallel dsh result (npm/PATH
+    // changed underneath it), so dsh has to be probed again below.
+    let mut dsh_stale = false;
+
+    // Node.js (install when the parallel probe found none). Installation stays
+    // sequential: dsh needs npm, so Node must be in place first.
+    if node_found.is_none() {
+        setup_log(app, "  开始自动安装 Node.js…");
         set_setup_item(&mut state, "node", "installing", "正在自动安装…");
         state.phase = "installing".into();
         state.message = "正在安装 Node.js…".into();
@@ -2072,17 +2576,23 @@ fn setup_and_start_inner(app: &tauri::AppHandle, port: u16) -> Result<(), String
             Err(e) => return setup_error(app, state, "node", "Node.js 安装失败", e),
         }
         publish_setup(app, state.clone());
+        dsh_found = None;
+        dsh_stale = true;
     }
 
     // dsh
-    setup_log(app, "[2/3] 检测 dsh…");
-    set_setup_item(&mut state, "dsh", "checking", "检测中…");
-    publish_setup(app, state.clone());
-    if let Some(v) = dsh_version() {
-        setup_log(app, format!("  已就绪(v{v})"));
-        set_setup_item(&mut state, "dsh", "ok", format!("v{v}"));
-    } else {
-        setup_log(app, "  未检测到 dsh，开始自动安装…");
+    if dsh_stale {
+        set_setup_item(&mut state, "dsh", "checking", "检测中…");
+        publish_setup(app, state.clone());
+        dsh_found = dsh_version();
+        if let Some(v) = &dsh_found {
+            setup_log(app, format!("  dsh 已就绪(v{v})"));
+            set_setup_item(&mut state, "dsh", "ok", format!("v{v}"));
+            publish_setup(app, state.clone());
+        }
+    }
+    if dsh_found.is_none() {
+        setup_log(app, "  开始自动安装 dsh…");
         set_setup_item(&mut state, "dsh", "installing", "正在自动安装…");
         state.phase = "installing".into();
         state.message = "正在安装 dsh…".into();
@@ -2098,7 +2608,7 @@ fn setup_and_start_inner(app: &tauri::AppHandle, port: u16) -> Result<(), String
     }
 
     // Start the dsh server.
-    setup_log(app, "[3/3] 启动 dsh 服务…");
+    setup_log(app, "启动 dsh 服务…");
     set_setup_item(&mut state, "service", "ok", "正在启动…");
     state.phase = "starting".into();
     state.message = "正在启动 dsh 服务…".into();
@@ -2905,10 +3415,12 @@ pub fn run() {
             std::process::exit(1);
         }
     }
-    // Merge machine + user PATH from the registry into this process, so tools
-    // this app installs (Node.js, npm, user-prefix dsh) are found by its
-    // children without restarting.
-    refresh_process_path();
+    // NOTE: refreshing PATH from the registry (so tools this app installs —
+    // Node.js, npm, user-prefix dsh — are found by its children) is deliberately
+    // NOT done here: spawning PowerShell costs ~1s and would delay the window and
+    // the loading page. It runs once at the start of the background setup thread
+    // instead; nothing above needs it (the WebView2 check uses the registry and
+    // the filesystem, and its installers are launched by absolute path).
 
     let global_shortcut_plugin = tauri_plugin_global_shortcut::Builder::new()
         .with_handler(|app, _shortcut, event| {
@@ -2937,11 +3449,14 @@ pub fn run() {
         .manage(WindowStateStore(Mutex::new(WindowStateCache {
             pending: None,
             last_saved: None,
+            last_maximized: None,
+            max_changed_at: None,
         })))
         .invoke_handler(tauri::generate_handler![
             switch_to,
             quit,
             set_bar_height,
+            toggle_maximize,
             stop_dsh_cmd,
             quit_with_dsh,
             restart_dsh,
@@ -3262,5 +3777,201 @@ mod tests {
         assert!(!rect_visible_on_monitors(1919.5, 0.0, 1.0, 1.0, 1.0, &monitors, 48.0));
         // Different scale factors convert logical->physical first.
         assert!(rect_visible_on_monitors(100.0, 50.0, 1280.0, 720.0, 2.0, &monitors, 48.0));
+    }
+
+    /// The work area of this machine's primary monitor as the tests model it:
+    /// 2048x1104 logical at 125% (2560x1380 physical).
+    fn test_work_area() -> WorkArea {
+        WorkArea {
+            x: 0.0,
+            y: 0.0,
+            w: 2560.0,
+            h: 1380.0,
+            scale: 1.25,
+        }
+    }
+
+    #[test]
+    fn maximize_artifact_is_rejected() {
+        let wa = test_work_area();
+        // Exactly what windows reports for a maximized window (work area plus
+        // the invisible border) - the real corrupted window-state.json on a
+        // 2560x1380@125% screen was x/y -7.2, 2062.4x1118.4 logical.
+        let (px, py, pw, ph) = (-7.2 * 1.25, -7.2 * 1.25, 2062.4 * 1.25, 1118.4 * 1.25);
+        assert!(rect_size_exceeds_work_area(pw, ph, &wa));
+        assert!(!rect_fits_work_area(
+            px,
+            py,
+            pw,
+            ph,
+            &wa,
+            GEOMETRY_BORDER_TOLERANCE * wa.scale
+        ));
+        // A plain normal window is accepted.
+        assert!(rect_fits_work_area(
+            125.0,
+            100.0,
+            1600.0,
+            900.0,
+            &wa,
+            GEOMETRY_BORDER_TOLERANCE * wa.scale
+        ));
+        assert!(!rect_size_exceeds_work_area(1600.0, 900.0, &wa));
+        // Snapped to the left edge: the outer rect starts at -9 physical px,
+        // which must stay acceptable thanks to the border tolerance.
+        assert!(rect_fits_work_area(
+            -9.0,
+            0.0,
+            1900.0,
+            1200.0,
+            &wa,
+            GEOMETRY_BORDER_TOLERANCE * wa.scale
+        ));
+        // Exactly the work area (no border inflation) still fits.
+        assert!(rect_fits_work_area(
+            0.0,
+            0.0,
+            2560.0,
+            1380.0,
+            &wa,
+            GEOMETRY_BORDER_TOLERANCE * wa.scale
+        ));
+        // One pixel over the work area does not.
+        assert!(!rect_fits_work_area(
+            0.0,
+            0.0,
+            2561.0,
+            1380.0,
+            &wa,
+            GEOMETRY_BORDER_TOLERANCE * wa.scale
+        ));
+        // Grossly negative coordinates are rejected.
+        assert!(!rect_fits_work_area(
+            -200.0,
+            -200.0,
+            1200.0,
+            800.0,
+            &wa,
+            GEOMETRY_BORDER_TOLERANCE * wa.scale
+        ));
+    }
+
+    #[test]
+    fn monitor_to_the_left_keeps_negative_coordinates() {
+        // Secondary monitor at physical x=-1920; a window at logical -1800 is
+        // legitimately negative and must not be treated as an artifact.
+        let wa = WorkArea {
+            x: -1920.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+            scale: 1.0,
+        };
+        assert!(rect_fits_work_area(
+            -1800.0,
+            50.0,
+            1280.0,
+            720.0,
+            &wa,
+            GEOMETRY_BORDER_TOLERANCE * wa.scale
+        ));
+        assert!(!rect_fits_work_area(
+            -2000.0,
+            50.0,
+            2000.0,
+            720.0,
+            &wa,
+            GEOMETRY_BORDER_TOLERANCE * wa.scale
+        ));
+    }
+
+    #[test]
+    fn fallback_is_1k_centered_and_clamped() {
+        // 2560x1380 @125% -> 2048x1104 logical: 1K fits and is centered.
+        let (x, y, w, h) = fallback_normal_bounds(&test_work_area());
+        assert_eq!((w, h), (1920.0, 1080.0));
+        assert_eq!((x, y), (64.0, 12.0));
+        // A big 4K work area keeps the plain 1K size, centered.
+        let big = WorkArea {
+            x: 0.0,
+            y: 0.0,
+            w: 3840.0,
+            h: 2160.0,
+            scale: 1.0,
+        };
+        assert_eq!(fallback_normal_bounds(&big), (960.0, 540.0, 1920.0, 1080.0));
+        // A small screen clamps the fallback to the work area.
+        let small = WorkArea {
+            x: 0.0,
+            y: 0.0,
+            w: 1366.0,
+            h: 728.0,
+            scale: 1.0,
+        };
+        assert_eq!(fallback_normal_bounds(&small), (0.0, 0.0, 1366.0, 728.0));
+        // Centering never goes below MIN_WINDOW_W/H.
+        let tiny = WorkArea {
+            x: 0.0,
+            y: 0.0,
+            w: 640.0,
+            h: 480.0,
+            scale: 1.0,
+        };
+        let (_, _, w, h) = fallback_normal_bounds(&tiny);
+        assert_eq!((w, h), (MIN_WINDOW_W, MIN_WINDOW_H));
+        // A monitor with a negative origin centers inside that monitor.
+        let left = WorkArea {
+            x: -1920.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+            scale: 1.0,
+        };
+        assert_eq!(fallback_normal_bounds(&left), (-1920.0, 0.0, 1920.0, 1080.0));
+    }
+
+    #[test]
+    fn centered_normal_bounds_first_run_and_off_screen() {
+        let wa = test_work_area();
+        // First run: 1280x720 centered on the 2048x1104 logical work area.
+        assert_eq!(
+            centered_normal_bounds(&wa, 1280.0, 720.0),
+            (384.0, 192.0, 1280.0, 720.0)
+        );
+        // Larger than the screen: clamped, then centered.
+        assert_eq!(
+            centered_normal_bounds(&wa, 4000.0, 4000.0),
+            (0.0, 0.0, 2048.0, 1104.0)
+        );
+    }
+
+    #[test]
+    fn maximize_settle_marks_the_flip() {
+        let mut cache = WindowStateCache {
+            pending: None,
+            last_saved: None,
+            last_maximized: None,
+            max_changed_at: None,
+        };
+        // First observation is treated as a flip (and the geometry it carries
+        // is therefore ignored), so the state right after startup is never
+        // mistaken for a settled one.
+        assert!(!maximize_state_settled(&mut cache, true));
+        assert!(!maximize_state_settled(&mut cache, false));
+        // Same state, long after the flip: settled.
+        cache.max_changed_at = Some(Instant::now() - GEOMETRY_SETTLE - Duration::from_millis(1));
+        assert!(maximize_state_settled(&mut cache, false));
+    }
+
+    #[test]
+    fn parse_package_version_reads_the_version_field() {
+        assert_eq!(
+            parse_package_version(r#"{"name":"@deepseek-ai/dsh","version":"0.1.0-rc.7"}"#),
+            Some("0.1.0-rc.7".into())
+        );
+        assert_eq!(parse_package_version(r#"{"name":"x"}"#), None);
+        assert_eq!(parse_package_version(r#"{"version":""}"#), None);
+        assert_eq!(parse_package_version(r#"{"version":42}"#), None);
+        assert_eq!(parse_package_version("not json"), None);
     }
 }

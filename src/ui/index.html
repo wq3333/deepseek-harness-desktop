@@ -152,6 +152,31 @@
       color: #fff;
     }
 
+    /* ---- 最大化 / 还原:same button, two icons ---- */
+    #btn-max .ic-restore {
+      display: none;
+    }
+
+    #btn-max.is-maximized .ic-max {
+      display: none;
+    }
+
+    #btn-max.is-maximized .ic-restore {
+      display: block;
+    }
+
+    /* Stale-hover guard. After the window is minimized and restored (taskbar
+       click, single-instance focus) the WebView2 keeps the last hovered control
+       highlighted until the pointer moves again — the minimize button then looks
+       "selected". While `.no-hover` is set the controls render their idle look;
+       the class is dropped by the first real pointer move, so normal hover comes
+       back immediately. */
+    .win-controls.no-hover button,
+    .win-controls.no-hover button.close {
+      background: transparent !important;
+      color: var(--muted) !important;
+    }
+
     /* ---- settings popup (bar webview expands over content while open) ---- */
     #settings-backdrop {
       position: fixed;
@@ -596,8 +621,14 @@
         </svg>
       </button>
       <button id="btn-max" title="最大化" aria-label="最大化">
-        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+        <svg class="ic-max" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
           <rect x="2" y="2" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.1" />
+        </svg>
+        <svg class="ic-restore" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+          <path d="M2.2 7.4V2.2h5.2" fill="none" stroke="currentColor" stroke-width="1.1"
+            stroke-linecap="round" stroke-linejoin="round" />
+          <rect x="4.4" y="4.4" width="5.4" height="5.4" rx="1" fill="none" stroke="currentColor"
+            stroke-width="1.1" />
         </svg>
       </button>
       <button id="btn-close" class="close" title="关闭" aria-label="关闭">
@@ -1075,6 +1106,75 @@
         }
       }
 
+      // ---- 最大化 / 还原 状态与图标同步 ----
+      // The button carries two icons; the Rust command returns the resulting
+      // state, and window resize/focus events keep it in sync for the paths
+      // this UI does not drive itself (drag-region double click, restore from
+      // the taskbar, the deferred startup maximize).
+      var lastMaxState = null;
+      function setMaxState(m) {
+        m = !!m;
+        if (m === lastMaxState) return;
+        lastMaxState = m;
+        var b = document.getElementById("btn-max");
+        if (!b) return;
+        b.classList.toggle("is-maximized", m);
+        b.title = m ? "还原" : "最大化";
+        b.setAttribute("aria-label", b.title);
+      }
+      function syncMaxState() {
+        win.isMaximized().then(setMaxState).catch(function () {});
+      }
+
+      // 最小化后(无论是从任务栏还是单实例聚焦恢复)WebView2 可能把最后一次 hover
+      // 高亮一直留在窗口控制按钮上,看起来像"被选中"。这里在窗口重新获得焦点/可见
+      // 时先压掉高亮,直到鼠标真正移动再恢复 hover。
+      var hoverResetBound = false;
+      function suppressControlsHover() {
+        var controls = document.querySelector(".win-controls");
+        if (!controls) return;
+        controls.classList.add("no-hover");
+        var active = document.activeElement;
+        if (active && active.parentElement === controls && active.blur) active.blur();
+        if (hoverResetBound) return;
+        hoverResetBound = true;
+        var drop = function () {
+          controls.classList.remove("no-hover");
+          window.removeEventListener("mousemove", drop);
+          window.removeEventListener("pointermove", drop);
+        };
+        window.addEventListener("mousemove", drop);
+        window.addEventListener("pointermove", drop);
+      }
+
+      if (win.onResized) {
+        var maxSyncTimer = null;
+        var wasMinimized = false;
+        win.onResized(function () {
+          if (maxSyncTimer) clearTimeout(maxSyncTimer);
+          maxSyncTimer = setTimeout(function () {
+            syncMaxState();
+            // Restored from the taskbar: the webview never saw a mouse leave,
+            // so drop the stale hover highlight even if no focus event arrived.
+            win.isMinimized().then(function (m) {
+              if (wasMinimized && !m) suppressControlsHover();
+              wasMinimized = m;
+            }).catch(function () {});
+          }, 100);
+        });
+      }
+      if (win.onFocusChanged) {
+        win.onFocusChanged(function (focused) {
+          if (!focused) return;
+          suppressControlsHover();
+          syncMaxState();
+        });
+      }
+      window.addEventListener("focus", suppressControlsHover);
+      document.addEventListener("visibilitychange", function () {
+        if (!document.hidden) suppressControlsHover();
+      });
+
       document.getElementById("toast").addEventListener("click", function () {
         if (window.__toastTimer) clearTimeout(window.__toastTimer);
         this.classList.remove("visible");
@@ -1083,15 +1183,22 @@
 
       document.getElementById("btn-min").addEventListener("click", function () {
         closeSettingsIfOpen();
+        // Drop the highlight before minimizing: the webview never sees the
+        // mouse leave, so the hover state would otherwise survive the restore.
+        suppressControlsHover();
         win.minimize();
       });
       document.getElementById("btn-max").addEventListener("click", function () {
         closeSettingsIfOpen();
-        win.isMaximized().then(function (m) { return m ? win.unmaximize() : win.maximize(); });
+        invoke("toggle_maximize").then(setMaxState).catch(function () {
+          syncMaxState();
+        });
       });
       document.getElementById("btn-close").addEventListener("click", function () {
         invoke("quit");
       });
+
+      syncMaxState();
 
       //win.maximize();
     })();
