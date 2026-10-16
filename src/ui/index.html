@@ -166,11 +166,16 @@
     }
 
     /* Stale-hover guard. After the window is minimized and restored (taskbar
-       click, single-instance focus) the WebView2 keeps the last hovered control
+       click, single-instance focus) WebView2 keeps the last hovered control
        highlighted until the pointer moves again — the minimize button then looks
-       "selected". While `.no-hover` is set the controls render their idle look;
-       the class is dropped by the first real pointer move, so normal hover comes
-       back immediately. */
+       "selected". While `.no-hover` is set the controls render their idle look.
+       The class is NOT dropped by a timer: with the mouse resting on the taskbar
+       the page receives no pointer events, so a timed release would just paint
+       the stale :hover right back. It is dropped only by a pointer event whose
+       coordinates differ from the position recorded when the mask was armed
+       (real movement — Chromium then recomputes hover from the true position),
+       or by a real click. A same-position mousemove is WebView2's synthetic
+       re-post after restore, not the user, and is ignored. */
     .win-controls.no-hover button,
     .win-controls.no-hover button.close {
       background: transparent !important;
@@ -604,13 +609,11 @@
       <button id="btn-chat">Chat</button>
       <button id="btn-harness" class="active">Harness</button>
       <button id="btn-settings" title="设置" aria-label="设置">
-        <svg class="gear" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
-          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <!-- gear: 8 teeth + rim + hub (stroke-width: teeth 1.9, rim/hub 1.2) -->
-          <path stroke-width="1.9"
-            d="M12.6 8L14.8 8M11.25 11.25L12.81 12.81M8 12.6L8 14.8M4.75 11.25L3.19 12.81M3.4 8L1.2 8M4.75 4.75L3.19 3.19M8 3.4L8 1.2M11.25 4.75L12.81 3.19" />
-          <circle cx="8" cy="8" r="4.7" stroke-width="1.2" />
-          <circle cx="8" cy="8" r="2.2" stroke-width="1.2" />
+        <svg class="gear" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-settings preview-icon">
+          <path
+            d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" />
+          <circle cx="12" cy="12" r="3" />
         </svg>
       </button>
     </div>
@@ -625,10 +628,9 @@
           <rect x="2" y="2" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.1" />
         </svg>
         <svg class="ic-restore" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-          <path d="M2.2 7.4V2.2h5.2" fill="none" stroke="currentColor" stroke-width="1.1"
-            stroke-linecap="round" stroke-linejoin="round" />
-          <rect x="4.4" y="4.4" width="5.4" height="5.4" rx="1" fill="none" stroke="currentColor"
-            stroke-width="1.1" />
+          <path d="M2.2 7.4V2.2h5.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"
+            stroke-linejoin="round" />
+          <rect x="4.4" y="4.4" width="5.4" height="5.4" rx="1" fill="none" stroke="currentColor" stroke-width="1.1" />
         </svg>
       </button>
       <button id="btn-close" class="close" title="关闭" aria-label="关闭">
@@ -644,12 +646,11 @@
   <div id="settings-modal" hidden>
     <div class="sm-head">
       <h2>
-        <svg class="gear" width="19" height="19" viewBox="0 0 16 16" fill="none" stroke="currentColor"
-          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path stroke-width="1.9"
-            d="M12.6 8L14.8 8M11.25 11.25L12.81 12.81M8 12.6L8 14.8M4.75 11.25L3.19 12.81M3.4 8L1.2 8M4.75 4.75L3.19 3.19M8 3.4L8 1.2M11.25 4.75L12.81 3.19" />
-          <circle cx="8" cy="8" r="4.7" stroke-width="1.2" />
-          <circle cx="8" cy="8" r="2.2" stroke-width="1.2" />
+        <svg class="gear" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-settings preview-icon">
+          <path
+            d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" />
+          <circle cx="12" cy="12" r="3" />
         </svg>
       </h2>
       <button id="settings-close" title="关闭" aria-label="关闭">✕</button>
@@ -1034,6 +1035,7 @@
       });
       document.getElementById("btn-settings").addEventListener("click", function () {
         if (settingsOpen) { closeSettings(); } else { openSettings(); }
+        releaseControlsHover();
       });
       // Clicking outside the panel (the dimmed backdrop) intentionally does NOT
       // close it: only ✕ / Esc / nav switch / window controls dismiss the panel.
@@ -1123,28 +1125,86 @@
         b.setAttribute("aria-label", b.title);
       }
       function syncMaxState() {
-        win.isMaximized().then(setMaxState).catch(function () {});
+        win.isMaximized().then(setMaxState).catch(function () { });
+      }
+
+      function clickMenuButton() {
+        var timer = setTimeout(() => {
+          if (document.querySelector("#btn-chat").classList.contains('active')) {
+            document.querySelector("#btn-chat").click();
+          }
+          else {
+            document.querySelector("#btn-harness").click();
+          }
+          clearTimeout(timer);
+        }, 2000);
       }
 
       // 最小化后(无论是从任务栏还是单实例聚焦恢复)WebView2 可能把最后一次 hover
-      // 高亮一直留在窗口控制按钮上,看起来像"被选中"。这里在窗口重新获得焦点/可见
-      // 时先压掉高亮,直到鼠标真正移动再恢复 hover。
-      var hoverResetBound = false;
+      // 高亮一直留在窗口控制按钮上,看起来像"被选中"。
+      //
+      // 根因:Chromium 内部记着的"最后一次鼠标位置"仍停留在按钮上;窗口隐藏期间
+      // 它收不到真实的 mouseleave/mousemove,恢复后 :hover 链依旧是旧的,而且
+      // WebView2 还可能按这个旧位置补发一条合成的 mousemove,把 hover 重新"坐实"。
+      //
+      // 修复:.no-hover 把控制条压成空闲外观,只在两种情况下解除 ——
+      //   1) 指针事件坐标与压制时刻不同(真实移动;此刻 Chromium 已按真实位置
+      //      重算 hover,解除后画出来的必然是正确状态);
+      //   2) 真实点击(pointerdown,WebView2 不会合成它,保证遮罩永不卡死)。
+      // 关键是绝不靠定时器解除:鼠标停在任务栏时页面收不到任何事件,定时器一响,
+      // 旧 hover 就原样画回来 —— 这正是上一版 350ms 定时器方案失败的原因。
+      var maskPos = { x: -1, y: -1 };  // 压制时页面看到的最后指针位置(快照)
+      var livePos = { x: -1, y: -1 };  // 持续跟踪的最后指针位置
+
+      function trackPointer(e) {
+        livePos.x = e.clientX;
+        livePos.y = e.clientY;
+      }
+      // capture 阶段先于 release 监听执行,保证比较用的坐标始终是最新事件。
+      window.addEventListener("mousemove", trackPointer, true);
+      window.addEventListener("pointermove", trackPointer, true);
+
+      function releaseControlsHover() {
+        var controls = document.querySelector(".win-controls");
+        if (controls) controls.classList.remove("no-hover");
+        window.removeEventListener("mousemove", onReleaseMove);
+        window.removeEventListener("pointermove", onReleaseMove);
+        window.removeEventListener("pointerdown", onReleaseDown);
+      }
+      // 坐标与压制时刻完全相同的 mousemove 是 WebView2 恢复窗口时按旧位置补发的
+      // 合成事件(或亚像素抖动),不代表用户动了鼠标 —— 忽略,继续等真实移动。
+      function onReleaseMove(e) {
+        if (e.clientX === maskPos.x && e.clientY === maskPos.y) return;
+        releaseControlsHover();
+      }
+      function onReleaseDown() {
+        releaseControlsHover();
+      }
       function suppressControlsHover() {
         var controls = document.querySelector(".win-controls");
         if (!controls) return;
         controls.classList.add("no-hover");
         var active = document.activeElement;
         if (active && active.parentElement === controls && active.blur) active.blur();
-        if (hoverResetBound) return;
-        hoverResetBound = true;
-        var drop = function () {
-          controls.classList.remove("no-hover");
-          window.removeEventListener("mousemove", drop);
-          window.removeEventListener("pointermove", drop);
-        };
-        window.addEventListener("mousemove", drop);
-        window.addEventListener("pointermove", drop);
+        // Force a fresh raster of the strip. WebView2 can retain the last
+        // composited frame (hover tint included) across minimize/restore, and a
+        // style-only change that computes to the same paint does not invalidate
+        // it; taking the element out of layout for one synchronous step does.
+        // No frame boundary is crossed in between, so this cannot flicker.
+        controls.style.display = "none";
+        void controls.offsetHeight;
+        controls.style.display = "";
+        maskPos.x = livePos.x;
+        maskPos.y = livePos.y;
+        // Re-arm (idempotent): drop stale bindings first so exactly one release
+        // is pending; every suppression must re-arm its own release or `.no-hover`
+        // would outlive the event that should clear it.
+        window.removeEventListener("mousemove", onReleaseMove);
+        window.removeEventListener("pointermove", onReleaseMove);
+        window.removeEventListener("pointerdown", onReleaseDown);
+        window.addEventListener("mousemove", onReleaseMove);
+        window.addEventListener("pointermove", onReleaseMove);
+        window.addEventListener("pointerdown", onReleaseDown);
       }
 
       if (win.onResized) {
@@ -1159,7 +1219,7 @@
             win.isMinimized().then(function (m) {
               if (wasMinimized && !m) suppressControlsHover();
               wasMinimized = m;
-            }).catch(function () {});
+            }).catch(function () { });
           }, 100);
         });
       }
@@ -1170,7 +1230,10 @@
           syncMaxState();
         });
       }
-      window.addEventListener("focus", suppressControlsHover);
+      // The document-level `focus` event is deliberately NOT used here: it also
+      // fires when the bar webview merely gains DOM focus (clicking the settings
+      // gear or any nav button), which has nothing to do with a minimized
+      // window and only risked masking a live hover.
       document.addEventListener("visibilitychange", function () {
         if (!document.hidden) suppressControlsHover();
       });
@@ -1183,10 +1246,9 @@
 
       document.getElementById("btn-min").addEventListener("click", function () {
         closeSettingsIfOpen();
-        // Drop the highlight before minimizing: the webview never sees the
-        // mouse leave, so the hover state would otherwise survive the restore.
         suppressControlsHover();
         win.minimize();
+        clickMenuButton();
       });
       document.getElementById("btn-max").addEventListener("click", function () {
         closeSettingsIfOpen();
