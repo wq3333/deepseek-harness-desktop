@@ -1128,18 +1128,6 @@
         win.isMaximized().then(setMaxState).catch(function () { });
       }
 
-      function clickMenuButton() {
-        var timer = setTimeout(() => {
-          if (document.querySelector("#btn-chat").classList.contains('active')) {
-            document.querySelector("#btn-chat").click();
-          }
-          else {
-            document.querySelector("#btn-harness").click();
-          }
-          clearTimeout(timer);
-        }, 2000);
-      }
-
       // 最小化后(无论是从任务栏还是单实例聚焦恢复)WebView2 可能把最后一次 hover
       // 高亮一直留在窗口控制按钮上,看起来像"被选中"。
       //
@@ -1248,7 +1236,6 @@
         closeSettingsIfOpen();
         suppressControlsHover();
         win.minimize();
-        clickMenuButton();
       });
       document.getElementById("btn-max").addEventListener("click", function () {
         closeSettingsIfOpen();
